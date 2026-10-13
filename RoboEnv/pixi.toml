@@ -1,0 +1,70 @@
+[workspace]
+name = "roboenv"
+channels = ["conda-forge"]
+# Windows, Linux and macOS (Intel & Apple Silicon) are all first-class targets.
+platforms = ["win-64", "linux-64", "osx-64", "osx-arm64"]
+
+[dependencies]
+# simulation stack
+pinocchio = "*"
+pybullet = "*"
+robot_descriptions = "*"
+casadi = "*"
+numpy = "*"
+matplotlib = "*"
+# Kalman filter inside the humanoid controller (scipy.linalg.block_diag) and
+# rotation utilities in the whole-body inverse dynamics (Rotation/rotvec).
+scipy = "*"
+# QP backend for the humanoid controller (is-mpc + whole-body inverse
+# dynamics). casadi conic plugins ship in Library/bin (conda) or the package
+# dir (pip) but only load inside an activated env with that dir on the DLL
+# search path; osqp is the portable fallback the QPSolver probes down to.
+osqp = "*"
+# Bayesian optimization (scikit-optimize's gp_minimize) used by lab exercises.
+scikit-optimize = ">=0.10.2,<0.11"
+
+# The git submodule is installed editable into the pixi environment.
+[pypi-dependencies]
+simulation_and_control = { path = "./simulation_and_control", editable = true }
+
+# --- machine-learning environment (ml) ----------------------------------------
+# torch/torchvision cannot live in the default environment: conda-forge
+# pytorch only ships CUDA or MKL-linked builds (conflicting with our OpenBLAS
+# pin on win-64), and the PyPI wheels have no CPython 3.14 osx-64 build. The
+# wheels therefore live in a separate `ml` environment restricted to the
+# platforms that actually ship cp314 wheels; the default feature (numpy,
+# matplotlib, ...) is inherited automatically.
+[feature.ml.pypi-dependencies]
+torch = "*"
+torchvision = "*"
+
+# torch (PyPI wheel) ships its own Intel OpenMP runtime (libiomp5md.dll) which
+# collides with conda-forge's libomp.dll loaded by numpy on Windows. Allow the
+# duplicate runtime in the ml environment only.
+[feature.ml.activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"
+
+[environments]
+ml = { features = ["ml"], platforms = ["win-64", "linux-64", "osx-arm64"] }
+
+# Force OpenBLAS on Windows: the default MKL variant crashes inside
+# numpy.linalg (delay-load of MKL's OpenMP runtime fails outside an
+# activated shell). See README troubleshooting for details.
+[target.win-64.dependencies]
+libblas = { version = "*", build = "*openblas*" }
+
+[tasks]
+
+# --- test / example scripts -------------------------------------------------
+test-cartesian-kin = "python tests/cartesian_kinematic_controller.py"
+test-cartesian-impedance = "python tests/cartesian_impedance_controller.py"
+test-humanoid-walk = "python tests/humanoid_walk_controller.py"
+test-mobile-base-kin = "python tests/mobile_base_kinematic_controller.py"
+test-mobile-base-arm-kin = "python tests/mobile_base_arm_kinematic_controller.py"
+test-eye-in-hand = "python tests/eye_in_hand_camera.py"
+
+# --- helpers -----------------------------------------------------------------
+# Quick check that the environment and the editable submodule import correctly.
+# The numpy.linalg.pinv call also exercises the BLAS/LAPACK backend, which has
+# crashed (native DLL delay-load) on Windows with the MKL variant.
+smoke-test = "python -c \"import numpy, pinocchio, pybullet, casadi, matplotlib, robot_descriptions, simulation_and_control; numpy.linalg.pinv(numpy.eye(3)); print('simulation_and_control OK')\""

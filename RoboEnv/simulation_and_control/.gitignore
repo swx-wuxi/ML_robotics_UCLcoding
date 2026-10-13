@@ -1,0 +1,30 @@
+# Ignore the build directory
+build/
+
+# Ignore the egg-info directory
+simulation_and_control.egg-info/
+simulation_and_control/__pycache__/__init__.cpython-39.pyc
+simulation_and_control/controllers/__pycache__/__init__.cpython-39.pyc
+simulation_and_control/controllers/__pycache__/CartesianKinematic.cpython-39.pyc
+simulation_and_control/controllers/__pycache__/DynamicCancellation.cpython-39.pyc
+simulation_and_control/controllers/__pycache__/FeedbackLin.cpython-39.pyc
+simulation_and_control/controllers/__pycache__/pin_wrapper.cpython-39.pyc
+simulation_and_control/controllers/__pycache__/servo_motor.cpython-39.pyc
+simulation_and_control/sim/__pycache__/__init__.cpython-39.pyc
+simulation_and_control/sim/__pycache__/pybullet_robot_interface.cpython-39.pyc
+simulation_and_control/utils/__pycache__/__init__.cpython-39.pyc
+simulation_and_control/utils/__pycache__/checking_input_from_config.cpython-39.pyc
+simulation_and_control/utils/__pycache__/SinusoidalRef.cpython-39.pyc
+simulation_and_control/__pycache__/__init__.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/__init__.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/CartesianKinematic.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/DynamicCancellation.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/FeedbackLin.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/MobileBaseController.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/pin_wrapper.cpython-311.pyc
+simulation_and_control/controllers/__pycache__/servo_motor.cpython-311.pyc
+simulation_and_control/sim/__pycache__/__init__.cpython-311.pyc
+simulation_and_control/sim/__pycache__/pybullet_robot_interface.cpython-311.pyc
+simulation_and_control/utils/__pycache__/__init__.cpython-311.pyc
+simulation_and_control/utils/__pycache__/checking_input_from_config.cpython-311.pyc
+simulation_and_control/utils/__pycache__/SinusoidalRef.cpython-311.pyc
