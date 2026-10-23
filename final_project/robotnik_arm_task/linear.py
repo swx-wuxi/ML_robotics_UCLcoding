@@ -1,147 +1,216 @@
-"""Linear behaviour-cloning baseline: state X -> expert action y.
+"""Train a linear behaviour-cloning baseline on a completed multi-episode dataset.
 
-Use least squares as in week 1, but predict actions instead of inertial parameters.
-Run: python linear.py. This script does not start the simulator.
+Run: python linear.py. No simulator is started.
 """
 
+import json
 from pathlib import Path
 
 import numpy as np
 
 
-DEFAULT_DATA = (Path(__file__).resolve().parent / "data" /
-                "expert_20261021T150137_884730Z" / "dataset.npz")
-MODEL_PATH = Path(__file__).resolve().parent / "linear_model.npz"
+ROOT = Path(__file__).resolve().parent
+# Set a specific dataset path, or leave None to select the latest completed batch.
+DATA_PATH = None
+MODEL_PATH = ROOT / "linear_model.npz"
+BATCH_SIZE = 50000
+SPLIT_NAMES = {0: "train", 1: "validation", 2: "test"}
+
+
+def find_dataset():
+    if DATA_PATH is not None:
+        return Path(DATA_PATH)
+    for folder in sorted((ROOT / "data").glob("expert_*"), reverse=True):
+        metadata = folder / "metadata.json"
+        dataset = folder / "dataset.npz"
+        if metadata.is_file() and dataset.is_file():
+            if json.loads(metadata.read_text())["episodes"] > 1:
+                return dataset
+    raise FileNotFoundError("No completed multi-episode dataset. Wait for collection "
+                            "to finish or set DATA_PATH explicitly.")
 
 
 def load_dataset(path):
+    # Load only training and plotting fields, not all diagnostic joint arrays.
+    keys = ("X", "y", "episode_id", "split", "episode_success", "time",
+            "feature_names", "action_names")
     with np.load(path, allow_pickle=False) as archive:
-        data = {key: archive[key] for key in archive.files}
-    X, y = data["X"], data["y"]
-    if X.ndim != 2 or X.shape[1] != 21 or y.shape != (len(X), 11):
-        raise ValueError("需要 X=(N, 21)、y=(N, 11) 的 Robotnik 数据集")
-    if not np.isfinite(X).all() or not np.isfinite(y).all():
-        raise ValueError("X/y 包含非有限值")
+        data = {key: archive[key] for key in keys}
+    n = len(data["X"])
+    if data["X"].shape != (n, 21) or data["y"].shape != (n, 11):
+        raise ValueError("Expected X=(N, 21) and y=(N, 11)")
+    for key in ("episode_id", "split", "episode_success", "time"):
+        if data[key].shape != (n,):
+            raise ValueError(f"Invalid shape for {key}")
+    if data["feature_names"].shape != (21,) or data["action_names"].shape != (11,):
+        raise ValueError("Invalid feature or action names")
+    if not np.isin(data["split"], [0, 1, 2]).all():
+        raise ValueError("Unknown split code")
+    for start in range(0, n, BATCH_SIZE):
+        if not (np.isfinite(data["X"][start:start + BATCH_SIZE]).all()
+                and np.isfinite(data["y"][start:start + BATCH_SIZE]).all()):
+            raise ValueError("Non-finite state or action")
     return data
 
 
-def split_indices(data, train_ratio=0.7):
-    """Use saved splits, otherwise hold out entire episodes or a time segment."""
-    n = len(data["X"])
-    success = data.get("episode_success", np.ones(n, dtype=bool))
-    eligible = np.flatnonzero(success)
-    split = data.get("split", np.zeros(n, dtype=np.int8))
-    train = np.flatnonzero(success & (split == 0))
-    heldout = {name: np.flatnonzero(success & (split == code))
-               for name, code in (("validation", 1), ("test", 2))}
-    if any(len(idx) for idx in heldout.values()):
-        if not len(train):
-            raise ValueError("已有验证/测试划分，但没有成功的训练样本")
-        return train, {k: v for k, v in heldout.items() if len(v)}
-
-    episodes = data.get("episode_id", np.zeros(n, dtype=int))
-    ids = np.unique(episodes[eligible])
-    if len(ids) > 1:
-        cut = min(len(ids) - 1, max(1, int(len(ids) * train_ratio)))
-        train = eligible[np.isin(episodes[eligible], ids[:cut])]
-        evaluation = eligible[np.isin(episodes[eligible], ids[cut:])]
-        print("按完整轨迹留出评估；相同目标仍可能出现在两组中。")
-    else:
-        cut = int(len(eligible) * train_ratio)
-        train, evaluation = eligible[:cut], eligible[cut:]
-        print("仅一条成功轨迹：前 70% 拟合，后 30% 时间留出。")
-        print("该评估不代表新目标或新轨迹的泛化能力，且两段可能处于不同控制阶段。")
-    if not len(train) or not len(evaluation):
-        raise ValueError("成功样本不足，无法划分训练和评估数据")
-    return train, {"holdout": evaluation}
+def split_indices(data):
+    """Keep successful episodes and preserve the collector's target-based split."""
+    groups = {}
+    episode_sets = []
+    for code, name in SPLIT_NAMES.items():
+        all_mask = data["split"] == code
+        idx = np.flatnonzero(all_mask & data["episode_success"])
+        episodes = np.unique(data["episode_id"][idx])
+        attempted = len(np.unique(data["episode_id"][all_mask]))
+        print(f"{name}: {len(episodes)}/{attempted} successful episodes, "
+              f"{len(idx)} usable samples")
+        if not len(idx):
+            raise ValueError(f"No successful samples in {name}; check collection results")
+        groups[name] = idx
+        episode_sets.append(set(episodes.tolist()))
+    for i in range(3):
+        for j in range(i):
+            if episode_sets[i] & episode_sets[j]:
+                raise ValueError("An episode appears in more than one split")
+    # Fixed targets are repeated per timestep; compare unique targets across splits.
+    target_sets = [set(map(tuple, np.unique(data["X"][idx, 18:21], axis=0)))
+                   for idx in groups.values()]
+    for i in range(3):
+        for j in range(i):
+            if target_sets[i] & target_sets[j]:
+                raise ValueError("A target appears in more than one split")
+    return groups
 
 
-def fit_linear_regression(X, y):
-    """Fit y = ((X - mean) / scale) @ W + b using training statistics only."""
-    mean = X.mean(axis=0)
-    scale = X.std(axis=0)
-    # Avoid division by zero for constant features such as a fixed target.
+def batches(indices):
+    for start in range(0, len(indices), BATCH_SIZE):
+        yield indices[start:start + BATCH_SIZE]
+
+
+def fit_linear_regression(X, y, indices):
+    """Fit standardized multi-output OLS using small incremental QR factorizations."""
+    # Combine batch statistics without constructing a full training-data copy.
+    count = 0
+    mean = np.zeros(21)
+    m2 = np.zeros(21)
+    action_sum = np.zeros(11)
+    for idx in batches(indices):
+        block = X[idx]
+        batch_mean = block.mean(axis=0)
+        delta = batch_mean - mean
+        total = count + len(idx)
+        m2 += ((block - batch_mean)**2).sum(axis=0)
+        m2 += delta**2 * count * len(idx) / total
+        mean += delta * len(idx) / total
+        count = total
+        action_sum += y[idx].sum(axis=0)
+    scale = np.sqrt(m2 / count)
     scale = np.where(scale < 1e-12, 1.0, scale)
-    design = np.column_stack(((X - mean) / scale, np.ones(len(X))))
-    # Like pinv in the reference, lstsq supports multiple outputs and rank deficiency.
-    coefficients, _, rank, _ = np.linalg.lstsq(design, y, rcond=None)
-    print(f"训练设计矩阵秩：{rank}/{design.shape[1]}")
-    return dict(mean=mean, scale=scale,
-                weights=coefficients[:-1], bias=coefficients[-1])
+
+    # QR compression preserves the least-squares minimizer without normal equations.
+    R = np.empty((0, 22))
+    projected_y = np.empty((0, 11))
+    for idx in batches(indices):
+        design = np.column_stack(((X[idx] - mean) / scale, np.ones(len(idx))))
+        Q, R = np.linalg.qr(np.vstack((R, design)), mode="reduced")
+        projected_y = Q.T @ np.vstack((projected_y, y[idx]))
+    coefficients, _, rank, _ = np.linalg.lstsq(R, projected_y, rcond=None)
+    print(f"Training design rank: {rank}/22")
+    return dict(mean=mean, scale=scale, weights=coefficients[:-1],
+                bias=coefficients[-1], action_mean=action_sum / count)
 
 
 def predict(model, X):
-    """Predict 11 actions for a batch of shape (N, 21) or one state of shape (21,)."""
+    """Map one state (21,) or a batch (N, 21) to 11 action commands."""
     X = np.asarray(X, dtype=float)
-    if X.ndim not in (1, 2) or X.shape[-1] != len(model["mean"]):
-        raise ValueError("预测输入应为 (21,) 或 (N, 21)")
+    if X.ndim not in (1, 2) or X.shape[-1] != 21:
+        raise ValueError("Expected state shape (21,) or (N, 21)")
     return ((X - model["mean"]) / model["scale"]) @ model["weights"] + model["bias"]
 
 
-def report_metrics(label, truth, prediction, action_names):
-    error = prediction - truth
-    rmse = np.sqrt(np.mean(error**2, axis=0))
-    mae = np.mean(np.abs(error), axis=0)
-    sse = np.sum(error**2, axis=0)
-    sst = np.sum((truth - truth.mean(axis=0))**2, axis=0)
-    # R-squared is undefined for constant targets, such as zero wheel speeds.
-    r2 = np.full(truth.shape[1], np.nan)
+def report_metrics(label, data, model, indices, constant=False):
+    """Accumulate sample-weighted metrics in batches; do not mix action units."""
+    count = 0
+    mean = np.zeros(11)
+    sst = np.zeros(11)
+    sse = np.zeros(11)
+    absolute_error = np.zeros(11)
+    for idx in batches(indices):
+        truth = data["y"][idx]
+        prediction = model["action_mean"] if constant else predict(model, data["X"][idx])
+        error = prediction - truth
+        sse += (error**2).sum(axis=0)
+        absolute_error += np.abs(error).sum(axis=0)
+        batch_mean = truth.mean(axis=0)
+        delta = batch_mean - mean
+        total = count + len(idx)
+        sst += ((truth - batch_mean)**2).sum(axis=0)
+        sst += delta**2 * count * len(idx) / total
+        mean += delta * len(idx) / total
+        count = total
+    rmse = np.sqrt(sse / count)
+    mae = absolute_error / count
+    r2 = np.full(11, np.nan)
     np.divide(sse, sst, out=r2, where=sst > 1e-12)
-    r2 = 1.0 - r2
-    print(f"\n{label}: {len(truth)} samples")
+    r2 = 1 - r2
+    print(f"\n{label}: {count} samples")
     print(f"{'Action':16s} {'RMSE':>12s} {'MAE':>12s} {'R2':>12s}")
-    for name, a, b, c in zip(action_names, rmse, mae, r2):
+    for name, a, b, c in zip(data["action_names"], rmse, mae, r2):
         print(f"{name:16s} {a:12.5g} {b:12.5g} {c:12.5g}")
-    print("Wheel RMSE (rad/s):", np.sqrt(np.mean(error[:, :4]**2)))
-    print("Arm RMSE (N*m):    ", np.sqrt(np.mean(error[:, 4:]**2)))
+    print("Wheel RMSE (rad/s):", np.sqrt(sse[:4].sum() / (count * 4)))
+    print("Arm RMSE (N*m):", np.sqrt(sse[4:].sum() / (count * 7)))
+    return dict(samples=count, rmse=rmse.tolist(), mae=mae.tolist(),
+                r2=[float(v) if np.isfinite(v) else None for v in r2])
 
 
-def plot_predictions(data, prediction, train, heldout):
+def plot_predictions(data, model, groups):
     import matplotlib.pyplot as plt
 
-    time = data.get("time", np.arange(len(prediction)))
-    names = data.get("action_names", [f"action_{i}" for i in range(11)])
-    fig, axes = plt.subplots(6, 2, figsize=(14, 14))
-    for j, ax in enumerate(axes.flat):
-        if j >= 11:
-            ax.axis("off")
-            continue
-        # Plot episodes separately to avoid connecting lines across time resets.
-        episode = data.get("episode_id", np.zeros(len(prediction), dtype=int))
-        for number in np.unique(episode):
-            idx = np.flatnonzero(episode == number)
-            ax.plot(time[idx], data["y"][idx, j], color="black", alpha=0.5)
-        ax.scatter(time[train], prediction[train, j], s=2, label="train prediction")
-        for label, idx in heldout.items():
-            ax.scatter(time[idx], prediction[idx, j], s=3, label=f"{label} prediction")
-        ax.set_title(f"{names[j]} ({'rad/s' if j < 4 else 'N*m'})")
-        ax.set_xlabel("Time (s)")
-        ax.grid(alpha=0.3)
-    axes.flat[0].plot([], [], color="black", label="expert")
-    axes.flat[0].legend()
+    # Show one complete successful episode per split, not thousands of overlapping lines.
+    fig, axes = plt.subplots(11, 3, figsize=(16, 22), sharex="col")
+    for column, (label, indices) in enumerate(groups.items()):
+        episode = data["episode_id"][indices[0]]
+        idx = indices[data["episode_id"][indices] == episode]
+        prediction = predict(model, data["X"][idx])
+        time = data["time"][idx]
+        for j in range(11):
+            ax = axes[j, column]
+            ax.plot(time, data["y"][idx, j], label="expert", color="black")
+            ax.plot(time, prediction[:, j], label="linear", alpha=0.8)
+            if column == 0:
+                unit = "rad/s" if j < 4 else "N*m"
+                ax.set_ylabel(f"{data['action_names'][j]} ({unit})")
+            if j == 0:
+                ax.set_title(f"{label}: episode {episode}")
+            ax.grid(alpha=0.3)
+        axes[-1, column].set_xlabel("Time (s)")
+    axes[0, 0].legend()
     fig.tight_layout()
+    fig.savefig(ROOT / "linear_predictions.png", dpi=150)
     plt.show()
 
 
 def main():
-    data = load_dataset(DEFAULT_DATA)
-    X, y = data["X"], data["y"]
-    train, heldout = split_indices(data)
-    model = fit_linear_regression(X[train], y[train])
-    prediction = predict(model, X)   # Core:Get the results
-    names = data.get("action_names", [f"action_{i}" for i in range(11)])
-    report_metrics("train", y[train], prediction[train], names)
-    for label, idx in heldout.items():
-        report_metrics(label, y[idx], prediction[idx], names)
-        # Compare against a constant prediction equal to the training action mean.
-        constant = np.broadcast_to(y[train].mean(axis=0), y[idx].shape)
-        report_metrics(f"{label} / training-mean baseline", y[idx], constant, names)
-
-    np.savez_compressed(MODEL_PATH, **model,
-                        feature_names=data["feature_names"],
-                        action_names=np.asarray(names))
+    path = find_dataset()
+    print(f"Dataset: {path.resolve()}")
+    data = load_dataset(path)
+    groups = split_indices(data)
+    model = fit_linear_regression(data["X"], data["y"], groups["train"])
+    metrics = {}
+    for label, indices in groups.items():
+        metrics[label] = report_metrics(label, data, model, indices)
+        if label != "train":
+            metrics[f"{label}_constant"] = report_metrics(
+                f"{label} / training-mean baseline", data, model, indices, constant=True)
+    np.savez_compressed(MODEL_PATH, **model, feature_names=data["feature_names"],
+                        action_names=data["action_names"], dataset_path=str(path.resolve()))
+    results = dict(dataset=str(path.resolve()),
+                   evaluation="Offline action prediction on successful expert episodes only",
+                   weighting="Per timestep; longer episodes contribute more samples",
+                   metrics=metrics)
+    (ROOT / "linear_metrics.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"Model saved: {MODEL_PATH}")
-    plot_predictions(data, prediction, train, heldout)
+    plot_predictions(data, model, groups)
 
 
 if __name__ == "__main__":

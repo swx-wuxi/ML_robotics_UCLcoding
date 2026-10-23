@@ -4,3 +4,6 @@ __pycache__/
 .pixi/
 RoboEnv/
 logging/
+final_project/robotnik_arm_task/data
+final_project/robotnik_arm_task/outputs
+final_project/robotnik_arm_task/evaluation
