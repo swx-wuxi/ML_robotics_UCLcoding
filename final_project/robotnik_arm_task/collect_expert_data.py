@@ -1,0 +1,281 @@
+"""Collect the unchanged expert task into a NumPy behaviour-cloning dataset.
+
+Each row pairs a PRE-ACTION observation with the expert command executed at
+that observation. Collection uses the original main() and controllers, rather
+than maintaining a second implementation of the expert. No training is done.
+"""
+
+import argparse
+from dataclasses import asdict
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
+
+# Collection never opens plot windows; --gui only enables the simulator GUI.
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/robotnik_matplotlib")
+import matplotlib
+matplotlib.use("Agg")
+import numpy as np
+
+import robotnik_arm_task as task
+
+
+FEATURE_NAMES = (
+    ["base_x", "base_y", "base_z", "base_yaw"]
+    + [f"arm_q_{i}" for i in range(1, 8)]
+    + [f"arm_qd_{i}" for i in range(1, 8)]
+    + ["target_x", "target_y", "target_z"]
+)
+ACTION_NAMES = ["wheel_FR", "wheel_FL", "wheel_BL", "wheel_BR"] + [
+    f"arm_torque_{i}" for i in range(1, 8)
+]
+
+
+# Target region in world coordinates. Initial robot states stay in the config.
+NUM_EPISODES = 1000
+TARGET_CENTER_XY = (0.0, 0.0)
+TARGET_MIN_RADIUS = 0.9
+TARGET_MAX_RADIUS = 1.5
+TARGET_HEIGHT = 0.5
+
+
+def sample_targets(count, seed):
+    """Sample uniformly by area in a horizontal annulus (inner radius 0: disk)."""
+    if count <= 0:
+        raise ValueError("Episode count must be positive")
+    if not 0 <= TARGET_MIN_RADIUS < TARGET_MAX_RADIUS:
+        raise ValueError("Require 0 <= inner radius < outer radius")
+    rng = np.random.default_rng(seed)
+    angle = rng.uniform(-np.pi, np.pi, count)
+    radius = np.sqrt(rng.uniform(TARGET_MIN_RADIUS**2, TARGET_MAX_RADIUS**2, count))
+    return np.column_stack((TARGET_CENTER_XY[0] + radius * np.cos(angle),
+                            TARGET_CENTER_XY[1] + radius * np.sin(angle),
+                            np.full(count, TARGET_HEIGHT)))
+
+
+def merge_episodes(out, summaries):
+    """Use temporary disk arrays to merge without keeping all episodes in RAM."""
+    total = sum(item["samples"] for item in summaries)
+    with tempfile.TemporaryDirectory(prefix="merge_", dir=out) as temp:
+        with np.load(out / "episode_0000.npz", allow_pickle=False) as first:
+            arrays = {
+                key: np.lib.format.open_memmap(
+                    Path(temp) / f"{key}.npy", mode="w+", dtype=first[key].dtype,
+                    shape=(total, *first[key].shape[1:]))
+                for key in first.files if key not in ("feature_names", "action_names")
+            }
+        offset = 0
+        for item in summaries:
+            with np.load(out / f"episode_{item['episode_id']:04d}.npz",
+                         allow_pickle=False) as episode:
+                end = offset + item["samples"]
+                for key, array in arrays.items():
+                    array[offset:end] = episode[key]
+                offset = end
+        np.savez_compressed(out / "dataset.npz", **arrays,
+                            feature_names=np.asarray(FEATURE_NAMES),
+                            action_names=np.asarray(ACTION_NAMES))
+        for array in arrays.values():
+            array.flush()
+        arrays.clear()
+
+
+
+def collect_episode(target, max_steps, gui=False):
+    """Temporarily instrument task call sites; restore them even on failure."""
+    originals = {name: getattr(task, name) for name in (
+        "base_controller", "arm_controller", "check_stop", "headless",
+        "max_steps", "TARGET_EE_POS",
+    )}
+    original_factory = task.pb.SimInterface
+    rows = []
+    context = {}
+    simulation = None
+    stop_message = None
+
+    def base_controller(*args, **kwargs):
+        state, pos, bearing, _, _, current_time, _ = args
+        context.update(base_pos=pos.copy(), base_yaw=bearing,
+                       time=current_time, phase_before=state.phase,
+                       done_before=state.done)
+        result = originals["base_controller"](*args, **kwargs)
+        context.update(wheels=result.copy(), phase_after=state.phase,
+                       done_after=state.done)
+        return result
+
+    def arm_controller(*args, **kwargs):
+        # Save all measured joints and expert reference BEFORE it is updated.
+        q, qd = args[2], args[3]
+        result = originals["arm_controller"](*args, **kwargs)
+        context.update(q=q.copy(), qd=qd.copy(), q_ref_before=args[4].copy(),
+                       ee_pos=args[7].copy(), torque=result[0].copy())
+        return result
+
+    def factory(*args, **kwargs):
+        nonlocal simulation
+        kwargs["use_gui"] = gui
+        simulation = original_factory(*args, **kwargs)
+        original_step = simulation.Step
+        
+        #***************************************
+        # ******* Choose the variable X ********
+        #***************************************
+        def step(*step_args, **step_kwargs):
+            # The expert controllers have run, but simulation has NOT advanced.
+            x = np.concatenate((context["base_pos"], [context["base_yaw"]],
+                                context["q"], context["qd"], target))
+            y = np.concatenate((context["wheels"], context["torque"]))
+            if not np.isfinite(x).all() or not np.isfinite(y).all():
+                raise ValueError("Non-finite expert state/action; collection aborted")
+            raw_q = np.array(simulation.GetMotorAngles(0), copy=True)
+            raw_qd = np.array(simulation.GetMotorVelocities(0), copy=True)
+            original_step(*step_args, **step_kwargs)
+            rows.append((x, y, context["time"], context["ee_pos"].copy(),
+                         raw_q, raw_qd, context["phase_before"],
+                         context["done_before"], context["phase_after"],
+                         context["done_after"], context["q_ref_before"].copy()))
+
+        simulation.Step = step
+        return simulation
+
+    def check_stop(*args, **kwargs):
+        nonlocal stop_message
+        stop_message = originals["check_stop"](*args, **kwargs)
+        return stop_message
+
+    try:
+        task.pb.SimInterface = factory
+        task.base_controller = base_controller
+        task.arm_controller = arm_controller
+        task.check_stop = check_stop
+        task.headless = True  # Skip plots and artificial sleep, even with --gui.
+        task.max_steps = max_steps
+        task.TARGET_EE_POS = target.copy()
+        task.main()
+        if not rows:
+            raise RuntimeError("Episode produced no samples")
+        # Measure AFTER the last executed command, not the task's cached state.
+        q_all = np.concatenate((simulation.GetBasePosition(),
+                                simulation.GetBaseOrientation(),
+                                simulation.GetMotorAngles(0)))
+        names = np.expand_dims(np.array(simulation.getNameActiveJoints()), 0)
+        model = task.PinWrapper("robotnik_arm.json", "pybullet", names,
+                                ["pybullet"], False, 0,
+                                str(Path(__file__).resolve().parent))
+        q_pin = model.ReoderJoints2PinVec(q_all, "pos")
+        task.pin.forwardKinematics(model.pin_model, model.pin_data, q_pin)
+        task.pin.updateFramePlacements(model.pin_model, model.pin_data)
+        ee = model.pin_data.oMf[model.pin_model.getFrameId(
+            "robot_j2s7s300_end_effector")].translation.copy()
+        summary = dict(target=target.tolist(), samples=len(rows),
+                       time_step=float(simulation.GetTimeStep()),
+                       stop_message=stop_message or "manual_exit",
+                       success=bool(stop_message and stop_message.startswith("Target reached")),
+                       final_ee_pos=ee.tolist(),
+                       final_error=float(np.linalg.norm(target - ee)))
+        columns = list(zip(*rows))
+        keys = ["X", "y", "time", "ee_pos", "q_mes", "qd_mes", "phase_before",
+                "nav_done_before", "phase_after", "nav_done_after", "q_ref_before"]
+        data = {key: np.asarray(values) for key, values in zip(keys, columns)}
+        data["ee_error"] = np.linalg.norm(data["ee_pos"] - target, axis=1)
+        return data, summary
+    finally:
+        task.pb.SimInterface = original_factory
+        for name, value in originals.items():
+            setattr(task, name, value)
+        if simulation is not None:
+            simulation.pybullet_client.disconnect()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+   
+    parser.add_argument("--target", type=float, nargs=3, action="append",
+                        metavar=("X", "Y", "Z"),
+                        help="Target position in metres; repeat for multiple targets. "
+                             "Otherwise sample the configured circular region")
+    parser.add_argument("--episodes", type=int, default=NUM_EPISODES,
+                        help="Number of sampled targets (default: 1000)")
+    parser.add_argument("--max-steps", type=int, default=40000)
+    parser.add_argument("--gui", action="store_true")
+    parser.add_argument("--seed", type=int, default=42, help="Target sampling and episode split seed")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="New output directory; existing paths are never overwritten")
+    args = parser.parse_args()
+    if args.max_steps <= 0:
+        parser.error("--max-steps must be positive")
+    if args.episodes <= 0:
+        parser.error("--episodes must be positive")
+    targets = (np.asarray(args.target, dtype=float) if args.target
+               else sample_targets(args.episodes, args.seed))
+    if not np.isfinite(targets).all():
+        parser.error("Targets must be finite")
+    out = args.output or Path(__file__).resolve().parent / "data" / datetime.now(
+        timezone.utc).strftime("expert_%Y%m%dT%H%M%S_%fZ")
+    out.mkdir(parents=True, exist_ok=False)
+    # Assign splits before collection so every saved episode is usable on its own.
+    unique, groups = np.unique(targets, axis=0, return_inverse=True)
+    order = np.random.default_rng(args.seed).permutation(len(unique))
+    group_split = np.zeros(len(unique), dtype=np.int8)
+    if len(unique) >= 3:
+        n_holdout = max(1, int(len(unique) * 0.15))
+        group_split[order[:n_holdout]] = 1
+        group_split[order[n_holdout:2 * n_holdout]] = 2
+    else:
+        print("Fewer than 3 distinct targets: all samples are training-only.")
+    plan = [dict(episode_id=i, target=target.tolist(),
+                 split=int(group_split[groups[i]])) for i, target in enumerate(targets)]
+    (out / "targets.json").write_text(json.dumps(plan, indent=2) + "\n")
+    summaries = []
+    for episode_id, target in enumerate(targets):
+        print(f"Collecting episode {episode_id + 1}/{len(targets)}: target={target}", flush=True)
+        data, summary = collect_episode(target, args.max_steps, args.gui)
+        count = len(data["X"])
+        split_code = int(group_split[groups[episode_id]])
+        data["episode_id"] = np.full(count, episode_id, dtype=np.int64)
+        data["split"] = np.full(count, split_code, dtype=np.int8)
+        data["episode_success"] = np.full(count, summary["success"], dtype=bool)
+        np.savez_compressed(out / f"episode_{episode_id:04d}.npz", **data,
+                            feature_names=np.asarray(FEATURE_NAMES),
+                            action_names=np.asarray(ACTION_NAMES))
+        summaries.append(dict(episode_id=episode_id, split=split_code, **summary))
+        (out / "episodes.json").write_text(json.dumps(summaries, indent=2) + "\n")
+        print(f"Saved episode {episode_id}: success={summary['success']}, "
+              f"final_error={summary['final_error']:.4f} m", flush=True)
+        del data
+
+    merge_episodes(out, summaries)
+    sample_count = sum(item["samples"] for item in summaries)
+    root = Path(__file__).resolve().parent
+    metadata = dict(
+        feature_names=FEATURE_NAMES, action_names=ACTION_NAMES,
+        split_codes={"train": 0, "validation": 1, "test": 2}, seed=args.seed,
+        samples=sample_count, episodes=len(summaries),
+        successful_episodes=sum(item["success"] for item in summaries),
+        target_sampling=(dict(mode="explicit") if args.target else dict(
+            mode="uniform_area_annulus", center_xy=TARGET_CENTER_XY,
+            min_radius=TARGET_MIN_RADIUS, max_radius=TARGET_MAX_RADIUS,
+            height=TARGET_HEIGHT)),
+        max_steps=args.max_steps, initial_conditions="Unchanged robotnik_arm.json defaults",
+        units="Positions: m; angles: rad; angular velocities: rad/s; torques: N*m",
+        alignment="X and diagnostic state are pre-action; y is the executed expert command",
+        failed_episodes="Retained and marked by episode_success; filter explicitly for training",
+        split_policy="Distinct targets grouped; <3 unique targets means train-only",
+        expert_memory="phase/nav_done before and after control, and q_ref_before saved as diagnostics",
+        base_params=asdict(task.BaseControllerParams(nav_timeout=task.BASE_NAV_TIMEOUT)),
+        arm_params=asdict(task.ArmControllerParams(reach_limit=task.ARM_REACH_LIMIT)),
+        source_sha256={name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                       for name in ["robotnik_arm_task.py", "robotnik_arm_control.py",
+                                    "configs/robotnik_arm.json"]},
+    )
+    (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"Saved {sample_count} samples: X=({sample_count}, 21), y=({sample_count}, 11)")
+    print(f"Dataset: {out.resolve() / 'dataset.npz'}")
+
+
+if __name__ == "__main__":
+    main()

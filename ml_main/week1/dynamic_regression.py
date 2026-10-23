@@ -79,6 +79,11 @@ def main():
             break
 
         # TODO (1)Compute regressor and store it
+        # ******************
+        # 用本次 Step 的速度增量匹配本次实际施加的力矩。（重点）
+        # ***************************
+        qdd_mes = (sim.GetMotorVelocities(0) - qd_mes) / time_step
+        
         regressor = dyn_model.ComputeDynamicRegressor(q_mes,qd_mes,qdd_mes)
         regressor_all.append(regressor.copy())
         tau_mes_all.append(tau_mes.copy())
@@ -87,10 +92,15 @@ def main():
         # Optional: print current time
         # print(f"Current time in seconds: {current_time:.2f}")
 
-    # TODO （1）After data collection, stack all the regressor and all the torque and compute the parameters 'a'  using pseudoinverse for all the joint
+    # TODO （1）After data collection, staGetMotorVelocitiesck all the regressor and all the torque and compute the parameters 'a'  using pseudoinverse for all the joint
     W = np.vstack(regressor_all)
-    T = np.concatenate(tau_mes_all)
-    a_est = np.linalg.pinv(W) @ T
+    # 参考 week2：启动后 0.1 s 再辨识；后 30% 留作预测验证。
+    fit_start = int(np.ceil(0.1 / time_step))
+    sample_count = len(regressor_all)
+    fit_end = fit_start + int(0.7 * (sample_count - fit_start))
+    if not fit_start < fit_end < sample_count:
+        raise ValueError("采样不足，请至少运行到启动阶段之后再退出")
+    fit_rows = slice(fit_start * num_joints, fit_end * num_joints)
 
     # TODO （2）reshape the regressor and the torque vector to isolate the last joint and find the its dynamical parameters
     # 获取模型中七个运动连杆的惯性参数，每个连杆 10 个
@@ -116,6 +126,11 @@ def main():
 
     # 扣除前六个连杆的已知力矩贡献
     T_last = T_pin - W_known @ a_known
+
+    # 保留全时段矩阵供绘图；估计和统计只使用训练时段。
+    W_last_all = W_last
+    W_last = W_last_all[fit_rows]
+    T_last = T_last[fit_rows]
 
     # 用伪逆求末端连杆的 10 个参数(Core)
     a_last_est = np.linalg.pinv(W_last) @ T_last
@@ -169,12 +184,26 @@ def main():
         print("Insufficient data or zero response energy for fit statistics.")
 
     # Reconstruct all joint torques in Pinocchio order.
-    torque_pred = (W_known @ a_known + W_last @ a_last_est).reshape(-1, 7)
+    torque_pred = (W_known @ a_known + W_last_all @ a_last_est).reshape(-1, 7)
     torque_true = T_pin.reshape(-1, 7)
     torque_error = torque_pred - torque_true
     print("\nTorque RMSE per joint:", np.sqrt(np.mean(torque_error**2, axis=0)))
 
     # TODO plot the torque prediction error for each joint (optional)
+    # 时间留出验证：这些样本没有用于拟合，不等同于独立第二次仿真。
+    validation_error = torque_error[fit_end:]
+    validation_true = torque_true[fit_end:]
+    rmse = np.sqrt(np.mean(validation_error**2, axis=0))
+    torque_rms = np.sqrt(np.mean(validation_true**2, axis=0))
+    relative_rmse = np.divide(rmse, torque_rms,
+                              out=np.full_like(rmse, np.nan), where=torque_rms > 0)
+    overall_relative = np.linalg.norm(validation_error) / np.linalg.norm(validation_true)
+    print(f"Fit interval: {fit_start * time_step:.3f}–{fit_end * time_step:.3f} s")
+    print("Held-out torque RMSE per joint (Nm):", rmse)
+    print("Held-out relative RMSE per joint (%):", 100 * relative_rmse)
+    print(f"Held-out overall relative RMSE: {100 * overall_relative:.6g}%")
+    print("Mass relative error (%):", 100 * abs(param_error[0]) / a_last_true[0])
+    print("Startup command is unchanged; excluded from fitting, retained in full-error plot.")
     # Plot the full error and a view after startup.
     sample_time = np.arange(torque_error.shape[0]) * time_step
     startup_time = 0.5

@@ -126,7 +126,90 @@ def main():
     last_joint_torque = tau_all[last_joint::num_joints, 0]
 
     # TODO: Implement decision tree regression fitting and add results to plots below
+    from sklearn.tree import DecisionTreeRegressor
+    from sklearn.metrics import mean_squared_error
 
+    # 每一行对应一个时间点：
+    # 7 个关节角度 + 7 个角速度 + 7 个角加速度
+    # X.shape = (N, 21)
+    X = np.hstack((
+        np.asarray(q_mes_all),
+        np.asarray(qd_mes_all),
+        np.asarray(qdd_mes_all),
+    ))
+
+    # 预测第七关节力矩，与现有线性模型使用相同标签 （目标输出）
+    y = last_joint_torque
+
+    # 跳过启动阶段，后 30% 数据用于测试
+    split = fit_start + int(0.7 * (len(X) - fit_start))
+    if not fit_start < split < len(X):
+        raise ValueError("采样不足，请延长仿真时间")
+
+    train = slice(fit_start, split)
+    test = slice(split, None)
+
+    tree = DecisionTreeRegressor(
+        max_depth=8,       # 可以改成 2、4、8、16 比较
+        random_state=42,
+    )
+    tree.fit(X[train], y[train])
+
+    tau_tree = tree.predict(X)
+    error_tree = tau_tree - y
+
+    # 原有线性模型使用了整个拟合时段。
+    # 为公平比较，重新只用前 70% 数据拟合线性模型。
+    train_rows = slice(
+        fit_start * num_joints,
+        split * num_joints,
+    )
+    W_train = regressor_all[train_rows]
+    a1 = np.linalg.pinv(W_train[:, 60:]) @ (
+        tau_all[train_rows] - W_train[:, :60] @ a_GT[:60]
+    )
+    tau_est = regressor_all @ np.vstack((a_GT[:60], a1))
+    error1 = tau_est - tau_all
+
+    linear_last = tau_est[last_joint::num_joints, 0]
+
+    print(
+        "Linear test RMSE:",
+        np.sqrt(mean_squared_error(y[test], linear_last[test])),
+    )
+    print(
+        "Decision tree test RMSE:",
+        np.sqrt(mean_squared_error(y[test], tau_tree[test])),
+    )
+
+    # 原有图在下面才创建，因此先保存 plt.subplots，
+    # 在创建图时加入决策树曲线是不必要的；
+    # 直接额外画一张完整的比较图。
+    fig_tree, (ax_torque, ax_err) = plt.subplots(
+        1, 2, figsize=(14, 6)
+    )
+
+    ax_torque.plot(y, label="Torque target", alpha=0.7)
+    ax_torque.plot(linear_last, label="Linear regression")
+    ax_torque.plot(tau_tree, label="Decision tree", alpha=0.8)
+
+    ax_err.plot(linear_last - y, label="Linear error")
+    ax_err.plot(error_tree, label="Decision tree error")
+
+    ax_torque.set_title("Joint 7 torque prediction")
+    ax_err.set_title("Prediction error")
+
+    for ax in (ax_torque, ax_err):
+        ax.axvline(
+            split, color="black", linestyle="--",
+            label="Test starts",
+        )
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Torque (Nm)")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    fig_tree.tight_layout()
     fig, (ax_pred, ax_error) = plt.subplots(
         1, 2, figsize=(14, 6), sharey=True
     )

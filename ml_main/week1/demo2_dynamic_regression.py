@@ -79,6 +79,10 @@ def main():
             break
 
         # TODO (1)Compute regressor and store it
+        # ******************
+        # 用本次 Step 的速度增量匹配本次实际施加的力矩。（重点）
+
+        qdd_mes = (sim.GetMotorVelocities(0) - qd_mes) / time_step
         regressor = dyn_model.ComputeDynamicRegressor(q_mes,qd_mes,qdd_mes)
         regressor_all.append(regressor.copy())
         tau_mes_all.append(tau_mes.copy())
@@ -86,134 +90,116 @@ def main():
         current_time += time_step
         # Optional: print current time
         # print(f"Current time in seconds: {current_time:.2f}")
-   
-    # TODO (1) Stack the regressors and measured torques.
-    # Each sample: regressor shape (7, 70), torque shape (7,).
+
+    # TODO （1）After data collection, stack all the regressor and all the torque and compute the parameters 'a'  using pseudoinverse for all the joint
     W = np.vstack(regressor_all)
+    # 参考 week2：启动后 0.1 s 再辨识；后 30% 留作预测验证。
+    fit_start = int(np.ceil(0.1 / time_step))
+    sample_count = len(regressor_all)
+    fit_end = fit_start + int(0.7 * (sample_count - fit_start))
+    if not fit_start < fit_end < sample_count:
+        raise ValueError("采样不足，请至少运行到启动阶段之后再退出")
+    fit_rows = slice(fit_start * num_joints, fit_end * num_joints)
 
-    # Match the torque order to the Pinocchio regressor order.
-    T_pin = np.concatenate([
-        np.asarray(
-            dyn_model.ReoderJoints2PinVec(tau, "vel")
-        ).reshape(-1)
-        for tau in tau_mes_all
-    ])
-    T = T_pin
-
-    if W.shape[1] != 70:
-        raise ValueError("Expected 70 inertial parameters for seven links.")
-
-    # Estimate all 70 parameters together.
-    # No true parameters are used in this estimation.
-    W_pinv = np.linalg.pinv(W)
-    a_est = W_pinv @ T
-
-    # TODO (2) Organize the estimated parameters by link.
-    # Each row contains the 10 estimated parameters of one link.
-    a_est_links = a_est.reshape(7, 10)
-
-    names = [
-        "m", "mc_x", "mc_y", "mc_z", "I_xx",
-        "I_xy", "I_yy", "I_xz", "I_yz", "I_zz"
-    ]
-
-    # Model truth is used ONLY for comparison after estimation.
+    # TODO (2) Estimate all links together and compare parameters
+    # 获取模型中七个运动连杆的惯性参数，每个连杆 10 个
+    # 固定子连杆的惯性,会合并到对应运动连杆中
     a_true = np.concatenate([
         np.asarray(inertia.toDynamicParameters()).reshape(-1)
         for inertia in dyn_model.pin_model.inertias[1:]
     ])
 
-    if a_true.size != 70:
-        raise ValueError("Expected seven links with 10 parameters each.")
+    if W.shape[1] != 70 or a_true.size != 70:
+        raise ValueError("预期模型包含七个运动连杆，每个连杆十个参数")
 
-    a_true_links = a_true.reshape(7, 10)
+    # 回归矩阵使用 Pinocchio 关节顺序，力矩也转换为相同顺序
+    T_pin = np.concatenate([
+        dyn_model.ReoderJoints2PinVec(tau, "vel")
+        for tau in tau_mes_all
+    ])
 
-    for link in range(7):
-        print(f"\nLink {link + 1}")
-        print("Parameter       True       Estimate     Abs. error")
-        for name, truth, estimate in zip(
-                names, a_true_links[link], a_est_links[link]):
-            print(
-                f"{name:8s} {truth:12.6g} {estimate:12.6g} "
-                f"{abs(estimate - truth):12.6g}"
-            )
+    # 所有连杆的 70 个参数均未知，不使用任何真值扣除力矩贡献。
+    W_fit = W[fit_rows]
+    T_fit = T_pin[fit_rows]
+    rcond = max(W_fit.shape) * np.finfo(float).eps
+    a_est = np.linalg.pinv(W_fit, rcond=rcond) @ T_fit
+    model_rank = np.linalg.matrix_rank(W_fit)
+    print(f"Regressor rank: {model_rank} / {W_fit.shape[1]}")
+    if model_rank < W_fit.shape[1]:
+        print("Rank deficient: individual physical parameters cannot all be "
+              "uniquely identified. This is a minimum-norm least-squares solution; "
+              "accurate torques do not imply accurate individual parameters.")
 
-    # Check how many parameter directions the data can identify.
-    model_rank = np.linalg.matrix_rank(W)
-    print(f"\nRegressor rank: {model_rank} / {W.shape[1]}")
+    # TODO （3）compute the metrics (R-squared adjusted etc...) for the linear model on a different file 
+    # Compare estimated parameters with model truth.
+    names = ["m", "mc_x", "mc_y", "mc_z", "I_xx", "I_xy",
+                 "I_yy", "I_xz", "I_yz", "I_zz"]
+    # 真值仅用于比较；没有参与以上估计。
+    param_error = a_est - a_true
+    for link in range(num_joints):
+        block = slice(10 * link, 10 * (link + 1))
+        print(f"\nLink {link + 1}: Parameter       True       Estimate     Abs. error")
+        for name, truth, estimate, error in zip(
+                names, a_true[block], a_est[block], param_error[block]):
+            print(f"{name:8s} {truth:12.6g} {estimate:12.6g} {abs(error):12.6g}")
+    parameter_names = [f"L{i+1}_{name}" for i in range(num_joints) for name in names]
 
-    if model_rank < W.shape[1]:
-        print(
-            "Rank deficient: the 70 individual parameters cannot "
-            "all be uniquely identified. The pseudoinverse returns "
-            "a minimum-norm least-squares solution."
-        )
-
-    # TODO (3) Compute training-fit metrics for all joint torques.
-    torque_pred_vector = W @ a_est
-    residual = T - torque_pred_vector
-
-    n = T.size
+    # Training-fit statistics for the no-intercept regression.
+    residual = T_fit - W_fit @ a_est
+    n = T_fit.size
     dof = n - model_rank
-    sse = float(residual @ residual)
-    sst = float(T @ T)
-
+    sse = residual @ residual
+    sst = T_fit @ T_fit
     if dof > 0 and sst > 0:
         r2 = 1 - sse / sst
         adj_r2 = 1 - (sse / dof) / (sst / n)
-
-        f_stat = (
-            ((sst - sse) / model_rank) / (sse / dof)
-            if model_rank > 0 and sse > 0 else np.nan
-        )
-
+        f_stat = ((sst - sse) / model_rank) / (sse / dof) if (
+            model_rank > 0 and sse > 0) else np.nan
         print(f"\nUncentered R-squared: {r2:.6g}")
         print(f"Adjusted uncentered R-squared: {adj_r2:.6g}")
         print(f"F-statistic (no intercept): {f_stat:.6g}")
 
-        # Classical OLS intervals assume independent,
-        # constant-variance errors.
-        if model_rank == W.shape[1]:
+        # Classical OLS intervals assume independent, constant-variance errors.
+        if model_rank == W_fit.shape[1]:
             try:
                 from scipy.stats import t as student_t
             except ImportError:
                 print("Confidence intervals require scipy.")
             else:
+                W_pinv = np.linalg.pinv(W_fit, rcond=rcond)
                 covariance = (sse / dof) * (W_pinv @ W_pinv.T)
                 margin = student_t.ppf(0.975, dof) * np.sqrt(
-                    np.maximum(np.diag(covariance), 0)
-                )
-
+                    np.maximum(np.diag(covariance), 0))
                 print("\nParameter     95% confidence interval")
-                for index, (estimate, delta) in enumerate(
-                        zip(a_est, margin)):
-                    link = index // 10 + 1
-                    name = names[index % 10]
-                    print(
-                        f"L{link} {name:8s} "
-                        f"[{estimate - delta:.6g}, "
-                        f"{estimate + delta:.6g}]"
-                    )
+                for name, estimate, delta in zip(parameter_names, a_est, margin):
+                    print(f"{name:8s} [{estimate - delta:.6g}, {estimate + delta:.6g}]")
         else:
-            print(
-                "Individual parameter confidence intervals skipped: "
-                "rank deficient."
-            )
+            print("Parameter confidence intervals skipped: rank deficient.")
     else:
         print("Insufficient data or zero response energy for fit statistics.")
 
     # Reconstruct all joint torques in Pinocchio order.
-    # These variables also feed the existing plotting code below.
-    torque_pred = torque_pred_vector.reshape(-1, 7)
+    torque_pred = (W @ a_est).reshape(-1, 7)
     torque_true = T_pin.reshape(-1, 7)
     torque_error = torque_pred - torque_true
+    print("\nTorque RMSE per joint:", np.sqrt(np.mean(torque_error**2, axis=0)))
 
-    print(
-        "\nTorque RMSE per joint:",
-        np.sqrt(np.mean(torque_error**2, axis=0))
-    )
-
-    # TODO （4 opt)plot the torque prediction error for each joint (optional)
+    # TODO plot the torque prediction error for each joint (optional)
+    # 时间留出验证：这些样本没有用于拟合，不等同于独立第二次仿真。
+    validation_error = torque_error[fit_end:]
+    validation_true = torque_true[fit_end:]
+    rmse = np.sqrt(np.mean(validation_error**2, axis=0))
+    torque_rms = np.sqrt(np.mean(validation_true**2, axis=0))
+    relative_rmse = np.divide(rmse, torque_rms,
+                              out=np.full_like(rmse, np.nan), where=torque_rms > 0)
+    overall_relative = np.linalg.norm(validation_error) / np.linalg.norm(validation_true)
+    print(f"Fit interval: {fit_start * time_step:.3f}–{fit_end * time_step:.3f} s")
+    print("Held-out torque RMSE per joint (Nm):", rmse)
+    print("Held-out relative RMSE per joint (%):", 100 * relative_rmse)
+    print(f"Held-out overall relative RMSE: {100 * overall_relative:.6g}%")
+    print("Mass relative errors per link (%):",
+          100 * np.abs(param_error[::10]) / a_true[::10])
+    print("Startup command is unchanged; excluded from fitting, retained in full-error plot.")
     # Plot the full error and a view after startup.
     sample_time = np.arange(torque_error.shape[0]) * time_step
     startup_time = 0.5
