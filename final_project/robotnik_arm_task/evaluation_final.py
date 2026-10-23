@@ -12,20 +12,26 @@ import time
 import numpy as np
 
 import robotnik_arm_task as task
-from tree_policy import predict_tree, validate_tree
+from nn_policy import predict_nn, validate_nn
+from tree_policy import (predict_tree, validate_tree, stage_tree, base_features,
+                         update_navigation, PHASE_CODES, TREE_KEYS, ArmHistory)
 
 
 ROOT = Path(__file__).resolve().parent
 # ************************************************
 # Change the model weights here for comparison
 # ************************************************
-MODEL_PATH = ROOT / "trained_model_weights"/"decision_tree_model.npz"
+MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_model.npz"
 NUM_TARGETS = 10
 TEST_SEED = 20261024
 USE_GUI = True
 PLAYBACK_SPEED = 1.0
 # Keep bounded commands, and save raw predictions separately for reproducibility.
 CLIP_COMMANDS = True
+# CORE CHANGE: require a settled base before enabling the reaching tree.
+BASE_SETTLE_SECONDS = 0.25
+BASE_STOP_LINEAR_SPEED = 0.02
+BASE_STOP_ANGULAR_SPEED = 0.05
 
 FEATURE_NAMES = (["base_x", "base_y", "base_z", "base_yaw"]
                  + [f"arm_q_{i}" for i in range(1, 8)]
@@ -38,7 +44,13 @@ ACTION_NAMES = (["wheel_FR", "wheel_FL", "wheel_BL", "wheel_BR"]
 def load_model():
     with np.load(MODEL_PATH, allow_pickle=False) as archive:
         model_type = str(archive["model_type"].item()) if "model_type" in archive else "linear"
-        if model_type == "decision_tree":
+        if model_type == "staged_neural_network":
+            keys = (tuple(f"base_{key}" for key in TREE_KEYS) +
+                    ("nn_x_mean", "nn_x_scale", "nn_y_mean", "nn_y_scale") +
+                    tuple(f"nn_{kind}{i}" for i in range(3) for kind in ("w", "b")))
+        elif model_type == "staged_decision_tree":
+            keys = tuple(f"{stage}_{key}" for stage in ("base", "arm") for key in TREE_KEYS)
+        elif model_type == "decision_tree":
             keys = ("children_left", "children_right", "feature", "threshold", "values")
         elif model_type == "linear":
             keys = ("mean", "scale", "weights", "bias")
@@ -46,12 +58,27 @@ def load_model():
             raise ValueError(f"Unknown model type: {model_type}")
         model = {key: archive[key] for key in keys}
         model["model_type"] = model_type
+        if model_type in ("staged_decision_tree", "staged_neural_network"):
+            # Old single-frame models remain loadable; new windows come from the archive.
+            for key, default in (("arm_window_steps", 1), ("arm_window_stride", 1)):
+                value = archive[key].item() if key in archive else default
+                if not isinstance(value, int) or value < 1:
+                    raise ValueError(f"Invalid temporal parameter: {key}")
+                model[key] = value
+            if "sample_time_step" in archive:
+                model["sample_time_step"] = float(archive["sample_time_step"].item())
         if archive["feature_names"].tolist() != FEATURE_NAMES:
             raise ValueError("Model feature order is incompatible")
         if archive["action_names"].tolist() != ACTION_NAMES:
             raise ValueError("Model action order is incompatible")
         dataset_path = Path(str(archive["dataset_path"].item()))
-    if model_type == "decision_tree":
+    if model_type == "staged_neural_network":
+        validate_tree(stage_tree(model, "base"), 8, 4)
+        validate_nn(model)
+    elif model_type == "staged_decision_tree":
+        validate_tree(stage_tree(model, "base"), 8, 4)
+        validate_tree(stage_tree(model, "arm"), 21 * model["arm_window_steps"], 7)
+    elif model_type == "decision_tree":
         validate_tree(model)
     else:
         for key, shape in {"mean": (21,), "scale": (21,),
@@ -88,7 +115,7 @@ def sample_test_targets(metadata, dataset_path):
 
 
 def run_episode(model, target, metadata, episode_id):
-    """Use the official simulation setup but apply only model-generated actions."""
+    """Evaluate learned actions; staged policies also use expert posture holding."""
     sim = None
     rows = []
     reason = "manual_exit"
@@ -119,19 +146,37 @@ def run_episode(model, target, metadata, episode_id):
                                    ["pybullet"], False, 0, str(ROOT))
         frame = dynamics.pin_model.getFrameId("robot_j2s7s300_end_effector")
 
+        measured_q_pin = None
+
         def measure():
+            nonlocal measured_q_pin
             pos = np.asarray(sim.GetBasePosition())
             ori = np.asarray(sim.GetBaseOrientation())
             q = np.asarray(sim.GetMotorAngles(0))
             qd = np.asarray(sim.GetMotorVelocities(0))
             yaw = task.quaternion2bearing(ori[3], ori[0], ori[1], ori[2])
             q_pin = dynamics.ReoderJoints2PinVec(np.concatenate((pos, ori, q)), "pos")
+            measured_q_pin = q_pin
             task.pin.forwardKinematics(dynamics.pin_model, dynamics.pin_data, q_pin)
             task.pin.updateFramePlacements(dynamics.pin_model, dynamics.pin_data)
             ee = dynamics.pin_data.oMf[frame].translation.copy()
             return np.concatenate((pos, [yaw], q[4:11], qd[4:11], target)), ee
 
-        # This shadow state is used ONLY by the unchanged official stop criteria.
+        staged = model["model_type"] in ("staged_decision_tree", "staged_neural_network")
+        neural_arm = model["model_type"] == "staged_neural_network"
+        base_tree = stage_tree(model, "base") if staged else None
+        arm_tree = stage_tree(model, "arm") if staged and not neural_arm else None
+        arm_history = ArmHistory(model.get("arm_window_steps", 1),
+                                 model.get("arm_window_stride", 1)) if staged else None
+        hold_q = np.asarray(sim.GetMotorAngles(0))[4:11].copy()
+        arm_params = task.ArmControllerParams(**metadata["arm_params"])
+        phase = "align"
+        arm_active = False
+        settled_time = 0.0
+        previous_pose = None
+        phase_log = []
+        arm_start_time = None
+        # For legacy models the navigation state remains a shadow for stop criteria.
         # Its expert wheel commands are discarded and never applied or fed to the policy.
         nav_state = task.BaseNavState()
         nav_params = task.BaseControllerParams(**metadata["base_params"])
@@ -142,6 +187,9 @@ def run_episode(model, target, metadata, episode_id):
         criteria = task.StopCriteria(reach_tolerance=task.REACH_TOLERANCE,
                                       max_steps=max_steps)
         dt = float(sim.GetTimeStep())
+        if staged and "sample_time_step" in model:
+            if not np.isclose(dt, model["sample_time_step"], rtol=1e-5, atol=1e-9):
+                raise ValueError("Simulation timestep differs from temporal training data")
         torque_limit = metadata["arm_params"]["max_torque"]
         wheel_limit = ((nav_params.max_lin_vel
                         + nav_params.max_ang_vel * nav_params.wheel_base_width / 2)
@@ -158,16 +206,59 @@ def run_episode(model, target, metadata, episode_id):
                 reason = "non_finite_state"
                 break
             error = float(np.linalg.norm(target - ee))
-            raw = (predict_tree(model, X) if model["model_type"] == "decision_tree" else
-                   ((X - model["mean"]) / model["scale"]) @ model["weights"] + model["bias"])
+            if staged:
+                # CORE CHANGE: the supervisor chooses the stage, never wheel actions.
+                # Arm joints are actively held with PD + gravity until base arrival.
+                if not arm_active:
+                    phase, arrived = update_navigation(
+                        phase, X[:3], X[3], goal, bearing,
+                        nav_params.pos_tol, nav_params.ang_tol)
+                    stopped = False
+                    if previous_pose is not None:
+                        linear_speed = np.linalg.norm(X[:2] - previous_pose[:2]) / dt
+                        yaw_delta = (X[3] - previous_pose[3] + np.pi) % (2*np.pi) - np.pi
+                        stopped = (linear_speed < BASE_STOP_LINEAR_SPEED and
+                                   abs(yaw_delta) / dt < BASE_STOP_ANGULAR_SPEED)
+                    settled_time = settled_time + dt if arrived and stopped else 0.0
+                    if settled_time >= BASE_SETTLE_SECONDS:
+                        arm_active = True
+                        arm_start_time = step * dt
+                        nav_state.done = True
+                        criteria.best_ee_error = error
+                        criteria.best_ee_error_time = step * dt
+                    elif step * dt > nav_params.nav_timeout:
+                        reason = "base_navigation_timeout"
+                        break
+                if arm_active:
+                    # CORE CHANGE: wheels remain stopped throughout arm reaching.
+                    # CORE CHANGE: append pre-action state once per arm step. The first
+                    # reaching state pads missing history, exactly as during training.
+                    arm_input = arm_history.append(X)
+                    arm_action = (predict_nn(model, arm_input) if neural_arm else predict_tree(
+                        arm_tree, arm_input, n_features=len(arm_input)))
+                    raw = np.concatenate((np.zeros(4), arm_action))
+                else:
+                    wheels = (np.zeros(4) if arrived else predict_tree(
+                        base_tree, base_features(X, PHASE_CODES[phase]), n_features=8))
+                    gravity = task.pin.computeGeneralizedGravity(
+                        dynamics.pin_model, dynamics.pin_data, measured_q_pin)
+                    hold_torque = arm_params.kp * (hold_q - X[4:11]) - arm_params.kd * X[11:18]
+                    hold_torque = np.clip(hold_torque + gravity[6:13], -torque_limit, torque_limit)
+                    raw = np.concatenate((wheels, hold_torque))
+                previous_pose = X[:4].copy()
+            else:
+                raw = (predict_tree(model, X) if model["model_type"] == "decision_tree" else
+                       ((X - model["mean"]) / model["scale"]) @ model["weights"] + model["bias"])
             if not np.isfinite(raw).all():
                 reason = "non_finite_prediction"
                 break
             action = np.clip(raw, -limits, limits) if CLIP_COMMANDS else raw.copy()
-            task.base_controller(nav_state, X[:3], X[3], goal, bearing, step * dt, nav_params)
+            if not staged:
+                task.base_controller(nav_state, X[:3], X[3], goal, bearing, step * dt, nav_params)
             cmd.SetControlCmd(np.concatenate((action, np.zeros(6))),
                               ["velocity"] * 4 + ["torque"] * 13)
             sim.Step(cmd, "torque")
+            phase_log.append("arm" if staged and arm_active else (phase if staged else "legacy"))
             rows.append((X.copy(), raw.copy(), action.copy(), step * dt, ee.copy(), error))
             if USE_GUI:
                 if step % 100 == 0:
@@ -201,11 +292,14 @@ def run_episode(model, target, metadata, episode_id):
                        final_error_m=final_error if final_finite else None,
                        final_ee_pos=final_ee.tolist() if np.isfinite(final_ee).all() else None,
                        final_base_pos=final_X[:3].tolist() if np.isfinite(final_X[:3]).all() else None,
-                       aborted=aborted)
+                       aborted=aborted, arm_start_time_s=arm_start_time,
+                       controller=("base tree + arm MLP + PD/gravity posture hold" if neural_arm else
+                                   "two trees + PD/gravity posture hold" if staged else "legacy"))
         if rows:
             columns = list(zip(*rows))
             data = {key: np.asarray(values) for key, values in zip(
                 ("X", "raw_actions", "actions", "time", "ee_pos", "ee_error"), columns)}
+            data["control_phase"] = np.asarray(phase_log)
             data["wheel_cmds"] = data["actions"][:, :4]
             data["torque_arm"] = data["actions"][:, 4:]
             summary["clipped_command_fraction"] = float(np.mean(
@@ -233,8 +327,13 @@ def main():
                     region=metadata["target_sampling"], gui=USE_GUI,
                     clip_commands=CLIP_COMMANDS, max_steps=metadata["max_steps"],
                     reach_tolerance_m=task.REACH_TOLERANCE,
-                    stop_policy="Official check_stop with shadow expert navigation state; "
-                                "expert commands discarded. Success also requires post-action tolerance.")
+                    arm_window_steps=model.get("arm_window_steps", 1),
+                    arm_window_stride=model.get("arm_window_stride", 1),
+                    base_settle_seconds=BASE_SETTLE_SECONDS,
+                    base_stop_linear_speed=BASE_STOP_LINEAR_SPEED,
+                    base_stop_angular_speed=BASE_STOP_ANGULAR_SPEED,
+                    stop_policy="Staged models: geometric arrival and settling gate; navigation timeout fails. "
+                                "Legacy models: shadow navigation. Official task success tolerance retained.")
     (out / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
     results = []
     for i, target in enumerate(targets):

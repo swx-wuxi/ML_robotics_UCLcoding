@@ -1,8 +1,8 @@
-"""Train a multi-output decision tree on the same dataset as linear.py.
+"""Train separate navigation and reaching decision trees on the same dataset as linear.py.
 
 Run: python decision_tree.py. No simulator is started.
 Load: model = dict(np.load("decision_tree_model.npz", allow_pickle=False))
-Infer: actions = predict(model, state)  # (21,) -> (11,)
+Evaluate: python evaluation_final.py (stage supervisor + arm posture hold).
 """
 
 import json
@@ -12,7 +12,7 @@ import numpy as np
 from sklearn.tree import DecisionTreeRegressor
 
 import linear
-from tree_policy import export_tree, predict_tree
+from tree_policy import (export_tree, base_features, PHASE_CODES, TREE_KEYS, TemporalFeatures)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,43 +22,39 @@ MODEL_PATH = ROOT / "trained_model_weights"/"decision_tree_model.npz"
 MAX_DEPTH = 32
 MIN_SAMPLES_LEAF = 1
 RANDOM_STATE = 42
+# CORE CHANGE: six states sampled every 20 steps, including the current state.
+# At dt=0.001 s this covers 0.100 s; the target is the CURRENT action, not a future action.
+ARM_WINDOW_STEPS = 6
+ARM_WINDOW_STRIDE = 20
 
 def predict(model, X):
-    """Map one state (21,) or a batch (N, 21) to 11 action commands."""
-    if "estimator" not in model:
-        return predict_tree(model, X)
-    X = np.asarray(X, dtype=float)
-    if X.ndim not in (1, 2) or X.shape[-1] != 21:
-        raise ValueError("Expected state shape (21,) or (N, 21)")
+    """Predict one stage's outputs; the runtime supervisor selects the stage."""
+    X = np.asarray(X)
     single = X.ndim == 1
-    prediction = model["estimator"].predict(X.reshape(-1, 21))
-    return prediction[0] if single else prediction
+    result = model["estimator"].predict(np.atleast_2d(X))
+    return result[0] if single else result
+
 
 def fit_decision_tree(X, y, indices):
-    """Fit all 11 outputs jointly, using only training samples.
-
-    Trees need no input standardization. Unlike the incremental linear fit,
-    sklearn's decision tree requires the training arrays to fit in memory.
-    """
     estimator = DecisionTreeRegressor(
-        max_depth=MAX_DEPTH,
-        min_samples_leaf=MIN_SAMPLES_LEAF,
+        max_depth=MAX_DEPTH, min_samples_leaf=MIN_SAMPLES_LEAF,
         random_state=RANDOM_STATE,
     )
     estimator.fit(X[indices], y[indices])
-    action_sum = np.zeros(11)
+    action_sum = np.zeros(y.shape[1])
     for idx in linear.batches(indices):
         action_sum += y[idx].sum(axis=0)
     print(f"Tree depth: {estimator.get_depth()}, leaves: {estimator.get_n_leaves()}")
     return dict(estimator=estimator, action_mean=action_sum / len(indices))
 
+
 def report_metrics(label, data, model, indices, constant=False):
     """Accumulate per-action errors without mixing wheel and arm units."""
     count = 0
-    mean = np.zeros(11)
-    sst = np.zeros(11)
-    sse = np.zeros(11)
-    absolute_error = np.zeros(11)
+    mean = np.zeros(data["y"].shape[1])
+    sst = np.zeros(data["y"].shape[1])
+    sse = np.zeros(data["y"].shape[1])
+    absolute_error = np.zeros(data["y"].shape[1])
     for idx in linear.batches(indices):
         truth = data["y"][idx]
         prediction = model["action_mean"] if constant else predict(model, data["X"][idx])
@@ -74,15 +70,13 @@ def report_metrics(label, data, model, indices, constant=False):
         count = total
     rmse = np.sqrt(sse / count)
     mae = absolute_error / count
-    r2 = np.full(11, np.nan)
+    r2 = np.full(data["y"].shape[1], np.nan)
     np.divide(sse, sst, out=r2, where=sst > 1e-12)
     r2 = 1 - r2
     print(f"\n{label}: {count} samples")
     print(f"{'Action':16s} {'RMSE':>12s} {'MAE':>12s} {'R2':>12s}")
     for name, a, b, c in zip(data["action_names"], rmse, mae, r2):
         print(f"{name:16s} {a:12.5g} {b:12.5g} {c:12.5g}")
-    print("Wheel RMSE (rad/s):", np.sqrt(sse[:4].sum() / (count * 4)))
-    print("Arm RMSE (N*m):", np.sqrt(sse[4:].sum() / (count * 7)))
     return dict(samples=count, rmse=rmse.tolist(), mae=mae.tolist(),
                 r2=[float(v) if np.isfinite(v) else None for v in r2])
 
@@ -91,24 +85,71 @@ def main():
     print(f"Dataset: {path.resolve()}")
     data = linear.load_dataset(path)
     groups = linear.split_indices(data)
-    model = fit_decision_tree(data["X"], data["y"], groups["train"])
-    model.update(feature_names=data["feature_names"], action_names=data["action_names"],
-                 dataset_path=str(path.resolve()))
-    np.savez_compressed(MODEL_PATH, **export_tree(model))
-    print(f"Model saved: {MODEL_PATH}")
+    # CORE CHANGE: use the recorded post-controller flag, which is exactly
+    # reach_active for this action. Zero wheel speed is NOT a phase label.
+    with np.load(path, allow_pickle=False) as archive:
+        done = archive["nav_done_after"]
+        phases = archive["phase_after"]
+    if done.shape != (len(data["X"]),) or done.dtype.kind != "b":
+        raise ValueError("Invalid nav_done_after labels")
+    if phases.shape != done.shape or not np.isin(phases, list(PHASE_CODES)).all():
+        raise ValueError("Invalid navigation phase labels")
+    codes = np.zeros(len(done), dtype=np.int8)
+    for name, code in PHASE_CODES.items():
+        codes[phases == name] = code
 
+    # CORE CHANGE: two independently fitted trees share the original target split.
+    # Base: only navigation samples, seven base/target fields + phase -> 4 wheels.
+    # Arm: reaching samples, causal history of 21 fields -> current 7 joint torques.
+    saved = dict(model_type=np.asarray("staged_decision_tree"),
+                 feature_names=data["feature_names"], action_names=data["action_names"],
+                 dataset_path=np.asarray(str(path.resolve())))
+    consecutive = data["episode_id"][1:] == data["episode_id"][:-1]
+    intervals = np.diff(data["time"])[consecutive]
+    if (not len(intervals) or np.any(intervals <= 0) or
+            not np.allclose(intervals, intervals[0], rtol=1e-5, atol=1e-9)):
+        raise ValueError("Temporal windows require a consistent positive timestep")
+    saved.update(arm_window_steps=np.asarray(ARM_WINDOW_STEPS),
+                 arm_window_stride=np.asarray(ARM_WINDOW_STRIDE),
+                 sample_time_step=np.asarray(float(intervals[0])))
+    print(f"Arm history: {ARM_WINDOW_STEPS} states, "
+          f"{(ARM_WINDOW_STEPS-1)*ARM_WINDOW_STRIDE*intervals[0]:.3f} s span")
     metrics = {}
-    for label, indices in groups.items():
-        metrics[label] = report_metrics(label, data, model, indices)
-        if label != "train":
-            metrics[f"{label}_constant"] = report_metrics(
-                f"{label} / training-mean baseline", data, model, indices, constant=True)
-    results = dict(dataset=str(path.resolve()), model=str(MODEL_PATH),
-                   parameters=model["estimator"].get_params(),
-                   evaluation="Offline action prediction on successful expert episodes only",
-                   weighting="Per timestep; longer episodes contribute more samples",
+    parameters = None
+    for stage, mask, outputs in (("base", ~done, slice(0, 4)),
+                                 ("arm", done, slice(4, 11))):
+        stage_data = dict(X=(base_features(data["X"], codes) if stage == "base" else TemporalFeatures(
+                              data["X"], data["episode_id"], done, ARM_WINDOW_STEPS, ARM_WINDOW_STRIDE)),
+                          y=data["y"][:, outputs], action_names=data["action_names"][outputs])
+        stage_groups = {name: idx[mask[idx]] for name, idx in groups.items()}
+        for name, idx in stage_groups.items():
+            print(f"{stage}/{name}: {len(idx)} samples")
+            if not len(idx):
+                raise ValueError(f"No {stage} samples in {name}")
+        model = fit_decision_tree(stage_data["X"], stage_data["y"], stage_groups["train"])
+        parameters = model["estimator"].get_params()
+        model.update(feature_names=data["feature_names"], action_names=stage_data["action_names"],
+                     dataset_path=str(path.resolve()))
+        exported = export_tree(model)
+        saved.update({f"{stage}_{key}": exported[key] for key in TREE_KEYS})
+        for name, idx in stage_groups.items():
+            metrics[f"{stage}_{name}"] = report_metrics(f"{stage}/{name}", stage_data, model, idx)
+            if name != "train":
+                metrics[f"{stage}_{name}_constant"] = report_metrics(
+                    f"{stage}/{name} baseline", stage_data, model, idx, constant=True)
+        del model, stage_data
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(MODEL_PATH, **saved)
+    results = dict(dataset=str(path.resolve()), model=str(MODEL_PATH), parameters=parameters,
+                   evaluation="Stage-specific offline errors on successful expert episodes",
+                   arm_window_steps=ARM_WINDOW_STEPS, arm_window_stride=ARM_WINDOW_STRIDE,
+                   window_order="oldest to newest; pad with first reaching state",
+                   phase_label="nav_done_after; base phase input uses phase_after",
                    metrics=metrics)
-    (ROOT / "decision_tree_metrics.json").write_text(json.dumps(results, indent=2) + "\n")
+    (ROOT / "outputs").mkdir(parents=True, exist_ok=True)
+    (ROOT / "outputs"/"decision_tree_metrics.json").write_text(json.dumps(results, indent=2) + "\n")
+    print(f"Two-tree model saved: {MODEL_PATH}")
+
 
 if __name__ == "__main__":
     main()
