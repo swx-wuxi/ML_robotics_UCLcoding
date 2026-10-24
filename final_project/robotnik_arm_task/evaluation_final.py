@@ -12,9 +12,8 @@ import time
 import numpy as np
 
 import robotnik_arm_task as task
-from nn_policy import predict_nn, validate_nn
-from tree_policy import (predict_tree, validate_tree, stage_tree, base_features,
-                         update_navigation, PHASE_CODES, TREE_KEYS, ArmHistory)
+from collections import deque
+import warnings
 
 
 ROOT = Path(__file__).resolve().parent
@@ -22,12 +21,14 @@ ROOT = Path(__file__).resolve().parent
 # Change the model weights here for comparison
 # ************************************************
 MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_model.npz"
-NUM_TARGETS = 10
-TEST_SEED = 20261024
+NUM_TARGETS = 100
+TEST_SEED = 20261024  # 32 1 
 USE_GUI = True
 PLAYBACK_SPEED = 1.0
 # Keep bounded commands, and save raw predictions separately for reproducibility.
 CLIP_COMMANDS = True
+# Diagnostic shadow only: its torques are logged and NEVER applied to the robot.
+LOG_EXPERT_DIAGNOSTICS = True
 # CORE CHANGE: require a settled base before enabling the reaching tree.
 BASE_SETTLE_SECONDS = 0.25
 BASE_STOP_LINEAR_SPEED = 0.02
@@ -41,11 +42,136 @@ ACTION_NAMES = (["wheel_FR", "wheel_FL", "wheel_BL", "wheel_BR"]
                 + [f"arm_torque_{i}" for i in range(1, 8)])
 
 
+PHASE_CODES = {'align': 0, 'drive': 1, 'orient': 2}
+BASE_COLUMNS = [0, 1, 2, 3, 18, 19, 20]
+TREE_KEYS = ('children_left', 'children_right', 'feature', 'threshold', 'values')
+
+
+def base_network(model):
+    return {k[5:]: v for k, v in model.items() if k.startswith('base_nn_')}
+
+
+def stage_tree(model, stage):
+    return {key: model[f'{stage}_{key}'] for key in TREE_KEYS}
+
+
+def validate_tree(model, n_features=21, n_outputs=11):
+    n = len(model['feature'])
+    if n == 0:
+        raise ValueError('Empty tree')
+    for key in TREE_KEYS[:-1]:
+        if model[key].shape != (n,) or not np.isfinite(model[key]).all():
+            raise ValueError(f'Invalid tree parameter: {key}')
+    for key in ('children_left', 'children_right', 'feature'):
+        if model[key].dtype.kind not in 'iu':
+            raise ValueError(f'Invalid integer tree parameter: {key}')
+    if model['values'].shape != (n, n_outputs) or not np.isfinite(model['values']).all():
+        raise ValueError('Invalid tree outputs')
+    left, right = model['children_left'], model['children_right']
+    internal = ~((left == -1) & (right == -1))
+    for child in (left[internal], right[internal]):
+        if np.any(child <= np.arange(n)[internal]) or np.any(child >= n):
+            raise ValueError('Invalid tree child index')
+    if np.any(model['feature'][internal] < 0) or np.any(model['feature'][internal] >= n_features):
+        raise ValueError('Invalid tree feature index')
+
+
+def predict_tree(model, X, n_features=21):
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim not in (1, 2) or X.shape[-1] != n_features or not np.isfinite(X).all():
+        raise ValueError('Invalid tree input')
+    single = X.ndim == 1
+    X = X.reshape(-1, n_features)
+    nodes = np.zeros(len(X), dtype=np.intp)
+    while True:
+        rows = np.flatnonzero(model['children_left'][nodes] != -1)
+        if not len(rows):
+            break
+        current = nodes[rows]
+        go_left = X[rows, model['feature'][current]] <= model['threshold'][current]
+        nodes[rows] = np.where(go_left, model['children_left'][current], model['children_right'][current])
+    result = model['values'][nodes]
+    return result[0] if single else result
+
+
+def update_navigation(phase, position, yaw, goal, bearing, pos_tol, ang_tol):
+    delta = goal - np.asarray(position)[:2]
+    distance = np.linalg.norm(delta)
+    heading_error = (np.arctan2(delta[1], delta[0]) - yaw + np.pi) % (2*np.pi) - np.pi
+    if phase == 'align' and (distance < pos_tol or abs(heading_error) < ang_tol):
+        phase = 'drive' if distance >= pos_tol else 'orient'
+    if phase == 'drive' and distance < pos_tol:
+        phase = 'orient'
+    yaw_error = (bearing - yaw + np.pi) % (2*np.pi) - np.pi
+    arrived = phase == 'orient' and distance < pos_tol and abs(yaw_error) < ang_tol
+    if phase == 'orient' and distance >= pos_tol:
+        phase = 'align'
+    return phase, bool(arrived)
+
+
+class ArmHistory:
+    def __init__(self, steps, stride):
+        if steps < 1 or stride < 1:
+            raise ValueError('Invalid history parameters')
+        self.stride = stride
+        self.history = deque(maxlen=1 + (steps-1)*stride)
+
+    def append(self, state):
+        if not self.history:
+            self.history.extend(np.asarray(state).copy() for _ in range(self.history.maxlen))
+        else:
+            self.history.append(np.asarray(state).copy())
+        return np.asarray(self.history, dtype=np.float32)[::self.stride].reshape(-1)
+
+
+def base_features(X, phase):
+    """Exclude arm states so arm deviations cannot change navigation predictions."""
+    X = np.asarray(X)
+    return np.concatenate((X[..., BASE_COLUMNS],
+                           np.broadcast_to(np.asarray(phase), X.shape[:-1])[..., None]), axis=-1)
+
+def validate_nn(model, n_features=None, n_outputs=7):
+    steps = np.asarray(model.get('arm_window_steps', 1))
+    if steps.shape != () or steps.dtype.kind not in 'iu' or steps.item() < 1:
+        raise ValueError('Invalid NN history length')
+    inputs = n_features if n_features is not None else 21 * int(steps.item())
+    for key, shape in {'nn_x_mean': (inputs,), 'nn_x_scale': (inputs,),
+                       'nn_y_mean': (n_outputs,), 'nn_y_scale': (n_outputs,)}.items():
+        if model[key].shape != shape or not np.isfinite(model[key]).all():
+            raise ValueError(f'Invalid NN parameter: {key}')
+    if np.any(model['nn_x_scale'] <= 0) or np.any(model['nn_y_scale'] <= 0):
+        raise ValueError('NN scales must be positive')
+    width = inputs
+    for i in range(3):
+        w, b = model[f'nn_w{i}'], model[f'nn_b{i}']
+        if (w.ndim != 2 or w.shape[0] != width or b.shape != (w.shape[1],)
+                or not np.isfinite(w).all() or not np.isfinite(b).all()):
+            raise ValueError(f'Invalid NN layer {i}')
+        width = w.shape[1]
+    if width != n_outputs:
+        raise ValueError(f'Expected {n_outputs} NN outputs')
+
+def predict_nn(model, X):
+    X = np.asarray(X, dtype=np.float32)
+    inputs = len(model['nn_x_mean'])
+    if X.ndim not in (1, 2) or X.shape[-1] != inputs or not np.isfinite(X).all():
+        raise ValueError(f'Expected finite input ({inputs},) or (N, {inputs})')
+    h = (X - model['nn_x_mean']) / model['nn_x_scale']
+    # CORE CHANGE: two Linear+ReLU hidden layers, linear regression output.
+    for i in range(3):
+        h = h @ model[f'nn_w{i}'] + model[f'nn_b{i}']
+        if i < 2:
+            h = np.maximum(h, 0)
+    return h * model['nn_y_scale'] + model['nn_y_mean']
+
+
 def load_model():
     with np.load(MODEL_PATH, allow_pickle=False) as archive:
         model_type = str(archive["model_type"].item()) if "model_type" in archive else "linear"
         if model_type == "staged_neural_network":
-            keys = (tuple(f"base_{key}" for key in TREE_KEYS) +
+            base_keys = (tuple(k for k in archive.files if k.startswith("base_nn_"))
+                         if "base_nn_x_mean" in archive else tuple(f"base_{key}" for key in TREE_KEYS))
+            keys = (base_keys +
                     ("nn_x_mean", "nn_x_scale", "nn_y_mean", "nn_y_scale") +
                     tuple(f"nn_{kind}{i}" for i in range(3) for kind in ("w", "b")))
         elif model_type == "staged_decision_tree":
@@ -73,7 +199,10 @@ def load_model():
             raise ValueError("Model action order is incompatible")
         dataset_path = Path(str(archive["dataset_path"].item()))
     if model_type == "staged_neural_network":
-        validate_tree(stage_tree(model, "base"), 8, 4)
+        if "base_nn_x_mean" in model:
+            validate_nn(base_network(model), n_features=8, n_outputs=4)
+        else:
+            validate_tree(stage_tree(model, "base"), 8, 4)
         validate_nn(model)
     elif model_type == "staged_decision_tree":
         validate_tree(stage_tree(model, "base"), 8, 4)
@@ -89,9 +218,15 @@ def load_model():
             raise ValueError("Model scale must be positive")
     # Use the exact collection settings associated with the trained model.
     metadata = json.loads((dataset_path.parent / "metadata.json").read_text())
-    for name, expected in metadata["source_sha256"].items():
-        if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != expected:
-            raise ValueError(f"Collection source/config changed: {name}")
+    # Whole-file hashes also change for comments; log mismatches without blocking.
+    changed = []
+    for name, expected in metadata.get("source_sha256", {}).items():
+        source = ROOT / name
+        if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+            changed.append(name)
+    if changed:
+        warnings.warn("Collection source/config differs: " + ", ".join(changed), stacklevel=2)
+    model["source_config_changes"] = changed
     return model, dataset_path, metadata
 
 
@@ -164,7 +299,8 @@ def run_episode(model, target, metadata, episode_id):
 
         staged = model["model_type"] in ("staged_decision_tree", "staged_neural_network")
         neural_arm = model["model_type"] == "staged_neural_network"
-        base_tree = stage_tree(model, "base") if staged else None
+        base_nn = base_network(model) if "base_nn_x_mean" in model else None
+        base_tree = stage_tree(model, "base") if staged and base_nn is None else None
         arm_tree = stage_tree(model, "arm") if staged and not neural_arm else None
         arm_history = ArmHistory(model.get("arm_window_steps", 1),
                                  model.get("arm_window_stride", 1)) if staged else None
@@ -175,6 +311,11 @@ def run_episode(model, target, metadata, episode_id):
         settled_time = 0.0
         previous_pose = None
         phase_log = []
+        expert_log = []
+        expert_q_ref = hold_q.copy()
+        shoulder_frame = dynamics.pin_model.getFrameId("robot_j2s7s300_link_2")
+        lower, upper = sim.GetBotJointsLimit()
+        arm_lower, arm_upper = np.asarray(lower)[4:11], np.asarray(upper)[4:11]
         arm_start_time = None
         # For legacy models the navigation state remains a shadow for stop criteria.
         # Its expert wheel commands are discarded and never applied or fed to the policy.
@@ -238,8 +379,10 @@ def run_episode(model, target, metadata, episode_id):
                         arm_tree, arm_input, n_features=len(arm_input)))
                     raw = np.concatenate((np.zeros(4), arm_action))
                 else:
-                    wheels = (np.zeros(4) if arrived else predict_tree(
-                        base_tree, base_features(X, PHASE_CODES[phase]), n_features=8))
+                    nav_input = base_features(X, PHASE_CODES[phase])
+                    wheels = (np.zeros(4) if arrived else
+                              predict_nn(base_nn, nav_input) if base_nn is not None else
+                              predict_tree(base_tree, nav_input, n_features=8))
                     gravity = task.pin.computeGeneralizedGravity(
                         dynamics.pin_model, dynamics.pin_data, measured_q_pin)
                     hold_torque = arm_params.kp * (hold_q - X[4:11]) - arm_params.kd * X[11:18]
@@ -255,6 +398,15 @@ def run_episode(model, target, metadata, episode_id):
             action = np.clip(raw, -limits, limits) if CLIP_COMMANDS else raw.copy()
             if not staged:
                 task.base_controller(nav_state, X[:3], X[3], goal, bearing, step * dt, nav_params)
+            # CORE DIAGNOSTIC: run the official expert on the SAME measured state.
+            # Its reference evolves along the learned rollout, not an expert rollout.
+            if staged and LOG_EXPERT_DIAGNOSTICS:
+                expert_torque, expert_q_ref, expert_qd_ref = task.arm_controller(
+                    dynamics, measured_q_pin, X[4:11], X[11:18], expert_q_ref,
+                    hold_q, target, ee.copy(), frame, shoulder_frame,
+                    arm_lower, arm_upper, dt, arm_params, reach_active=arm_active)
+                expert_log.append((expert_torque.copy(), expert_q_ref.copy(),
+                                   expert_qd_ref.copy()))
             cmd.SetControlCmd(np.concatenate((action, np.zeros(6))),
                               ["velocity"] * 4 + ["torque"] * 13)
             sim.Step(cmd, "torque")
@@ -293,13 +445,18 @@ def run_episode(model, target, metadata, episode_id):
                        final_ee_pos=final_ee.tolist() if np.isfinite(final_ee).all() else None,
                        final_base_pos=final_X[:3].tolist() if np.isfinite(final_X[:3]).all() else None,
                        aborted=aborted, arm_start_time_s=arm_start_time,
-                       controller=("base tree + arm MLP + PD/gravity posture hold" if neural_arm else
+                       controller=("base MLP + arm MLP + PD/gravity posture hold" if base_nn is not None else
+                                   "base tree + arm MLP + PD/gravity posture hold" if neural_arm else
                                    "two trees + PD/gravity posture hold" if staged else "legacy"))
         if rows:
             columns = list(zip(*rows))
             data = {key: np.asarray(values) for key, values in zip(
                 ("X", "raw_actions", "actions", "time", "ee_pos", "ee_error"), columns)}
             data["control_phase"] = np.asarray(phase_log)
+            if expert_log:
+                data["expert_shadow_torque"] = np.asarray([v[0] for v in expert_log])
+                data["expert_shadow_q_ref"] = np.asarray([v[1] for v in expert_log])
+                data["expert_shadow_qd_ref"] = np.asarray([v[2] for v in expert_log])
             data["wheel_cmds"] = data["actions"][:, :4]
             data["torque_arm"] = data["actions"][:, 4:]
             summary["clipped_command_fraction"] = float(np.mean(
@@ -322,13 +479,14 @@ def main():
     targets = sample_test_targets(metadata, dataset_path)
     out = ROOT / "evaluation" / datetime.now(timezone.utc).strftime("final_%Y%m%dT%H%M%S_%fZ")
     out.mkdir(parents=True, exist_ok=False)
-    settings = dict(model=str(MODEL_PATH), model_sha256=hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest(),
+    settings = dict(source_config_changes=model.get("source_config_changes", []), model=str(MODEL_PATH), model_sha256=hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest(),
                     dataset=str(dataset_path), seed=TEST_SEED, targets=targets.tolist(),
                     region=metadata["target_sampling"], gui=USE_GUI,
                     clip_commands=CLIP_COMMANDS, max_steps=metadata["max_steps"],
                     reach_tolerance_m=task.REACH_TOLERANCE,
                     arm_window_steps=model.get("arm_window_steps", 1),
                     arm_window_stride=model.get("arm_window_stride", 1),
+                    expert_shadow_diagnostics=LOG_EXPERT_DIAGNOSTICS,
                     base_settle_seconds=BASE_SETTLE_SECONDS,
                     base_stop_linear_speed=BASE_STOP_LINEAR_SPEED,
                     base_stop_angular_speed=BASE_STOP_ANGULAR_SPEED,

@@ -8,5 +8,3 @@ final_project/robotnik_arm_task/data
 final_project/robotnik_arm_task/outputs
 final_project/robotnik_arm_task/evaluation
 final_project/robotnik_arm_task/trained_model_weights
-/final_project/robotnik_arm_task/trained_model_weights/neural_network_model.npz
-/final_project/robotnik_arm_task/trained_model_weights/decision_tree_model.npz

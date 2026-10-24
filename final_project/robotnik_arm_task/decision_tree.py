@@ -1,4 +1,4 @@
-"""Train separate navigation and reaching decision trees on the same dataset as linear.py.
+"""Train separate navigation and reaching decision trees on the same dataset as py.
 
 Run: python decision_tree.py. No simulator is started.
 Load: model = dict(np.load("decision_tree_model.npz", allow_pickle=False))
@@ -11,12 +11,10 @@ from pathlib import Path
 import numpy as np
 from sklearn.tree import DecisionTreeRegressor
 
-import linear
-from tree_policy import (export_tree, base_features, PHASE_CODES, TREE_KEYS, TemporalFeatures)
 
 
 ROOT = Path(__file__).resolve().parent
-# None selects the latest completed batch, just as in linear.py.
+# None selects the latest completed batch, just as in py.
 DATA_PATH = None
 MODEL_PATH = ROOT / "trained_model_weights"/"decision_tree_model.npz"
 MAX_DEPTH = 32
@@ -26,6 +24,114 @@ RANDOM_STATE = 42
 # At dt=0.001 s this covers 0.100 s; the target is the CURRENT action, not a future action.
 ARM_WINDOW_STEPS = 6
 ARM_WINDOW_STRIDE = 20
+
+# Self-contained data/inference helpers; no auxiliary policy module imports.
+DATA_BATCH_SIZE = 50000
+SPLIT_NAMES = {0: "train", 1: "validation", 2: "test"}
+
+PHASE_CODES = {"align": 0, "drive": 1, "orient": 2}
+BASE_COLUMNS = [0, 1, 2, 3, 18, 19, 20]
+TREE_KEYS = ("children_left", "children_right", "feature", "threshold", "values")
+
+def find_dataset():
+    if DATA_PATH is not None:
+        return Path(DATA_PATH)
+    for folder in sorted((ROOT / "data").glob("expert_*"), reverse=True):
+        metadata = folder / "metadata.json"
+        dataset = folder / "dataset.npz"
+        if metadata.is_file() and dataset.is_file():
+            if json.loads(metadata.read_text())["episodes"] > 1:
+                return dataset
+    raise FileNotFoundError("No completed multi-episode dataset. Wait for collection "
+                            "to finish or set DATA_PATH explicitly.")
+
+def load_dataset(path):
+    # Load only training and plotting fields, not all diagnostic joint arrays.
+    keys = ("X", "y", "episode_id", "split", "episode_success", "time",
+            "feature_names", "action_names")
+    with np.load(path, allow_pickle=False) as archive:
+        data = {key: archive[key] for key in keys}
+    n = len(data["X"])
+    if data["X"].shape != (n, 21) or data["y"].shape != (n, 11):
+        raise ValueError("Expected X=(N, 21) and y=(N, 11)")
+    for key in ("episode_id", "split", "episode_success", "time"):
+        if data[key].shape != (n,):
+            raise ValueError(f"Invalid shape for {key}")
+    if data["feature_names"].shape != (21,) or data["action_names"].shape != (11,):
+        raise ValueError("Invalid feature or action names")
+    if not np.isin(data["split"], [0, 1, 2]).all():
+        raise ValueError("Unknown split code")
+    for start in range(0, n, DATA_BATCH_SIZE):
+        if not (np.isfinite(data["X"][start:start + DATA_BATCH_SIZE]).all()
+                and np.isfinite(data["y"][start:start + DATA_BATCH_SIZE]).all()):
+            raise ValueError("Non-finite state or action")
+    return data
+
+def split_indices(data):
+    """Keep successful episodes and preserve the collector's target-based split."""
+    groups = {}
+    episode_sets = []
+    for code, name in SPLIT_NAMES.items():
+        all_mask = data["split"] == code
+        idx = np.flatnonzero(all_mask & data["episode_success"])
+        episodes = np.unique(data["episode_id"][idx])
+        attempted = len(np.unique(data["episode_id"][all_mask]))
+        print(f"{name}: {len(episodes)}/{attempted} successful episodes, "
+              f"{len(idx)} usable samples")
+        if not len(idx):
+            raise ValueError(f"No successful samples in {name}; check collection results")
+        groups[name] = idx
+        episode_sets.append(set(episodes.tolist()))
+    for i in range(3):
+        for j in range(i):
+            if episode_sets[i] & episode_sets[j]:
+                raise ValueError("An episode appears in more than one split")
+    # Fixed targets are repeated per timestep; compare unique targets across splits.
+    target_sets = [set(map(tuple, np.unique(data["X"][idx, 18:21], axis=0)))
+                   for idx in groups.values()]
+    for i in range(3):
+        for j in range(i):
+            if target_sets[i] & target_sets[j]:
+                raise ValueError("A target appears in more than one split")
+    return groups
+
+def batches(indices):
+    for start in range(0, len(indices), DATA_BATCH_SIZE):
+        yield indices[start:start + DATA_BATCH_SIZE]
+
+def export_tree(model):
+    tree = model["estimator"].tree_
+    return dict(model_type=np.asarray("decision_tree"),
+                children_left=tree.children_left, children_right=tree.children_right,
+                feature=tree.feature, threshold=tree.threshold,
+                values=tree.value[:, :, 0], action_mean=model["action_mean"],
+                feature_names=model["feature_names"], action_names=model["action_names"],
+                dataset_path=np.asarray(model["dataset_path"]))
+
+def base_features(X, phase):
+    """Exclude arm states so arm deviations cannot change navigation predictions."""
+    X = np.asarray(X)
+    return np.concatenate((X[..., BASE_COLUMNS],
+                           np.broadcast_to(np.asarray(phase), X.shape[:-1])[..., None]), axis=-1)
+
+class TemporalFeatures:
+    """Build requested causal windows without expanding the entire dataset."""
+
+    def __init__(self, X, episode_id, active, steps, stride):
+        if steps < 1 or stride < 1:
+            raise ValueError("Window steps and stride must be positive")
+        self.X, self.steps, self.stride = X, steps, stride
+        # CORE CHANGE: reset at episode AND stage boundaries; never use future data.
+        reset = np.r_[True, (episode_id[1:] != episode_id[:-1]) |
+                      (active[1:] != active[:-1])]
+        self.starts = np.maximum.accumulate(np.where(reset, np.arange(len(X)), 0))
+
+    def __getitem__(self, indices):
+        indices = np.asarray(indices)
+        offsets = np.arange(self.steps - 1, -1, -1) * self.stride
+        rows = np.maximum(indices[..., None] - offsets, self.starts[indices][..., None])
+        return self.X[rows].astype(np.float32).reshape(*indices.shape, self.steps * 21)
+
 
 def predict(model, X):
     """Predict one stage's outputs; the runtime supervisor selects the stage."""
@@ -42,7 +148,7 @@ def fit_decision_tree(X, y, indices):
     )
     estimator.fit(X[indices], y[indices])
     action_sum = np.zeros(y.shape[1])
-    for idx in linear.batches(indices):
+    for idx in batches(indices):
         action_sum += y[idx].sum(axis=0)
     print(f"Tree depth: {estimator.get_depth()}, leaves: {estimator.get_n_leaves()}")
     return dict(estimator=estimator, action_mean=action_sum / len(indices))
@@ -55,7 +161,7 @@ def report_metrics(label, data, model, indices, constant=False):
     sst = np.zeros(data["y"].shape[1])
     sse = np.zeros(data["y"].shape[1])
     absolute_error = np.zeros(data["y"].shape[1])
-    for idx in linear.batches(indices):
+    for idx in batches(indices):
         truth = data["y"][idx]
         prediction = model["action_mean"] if constant else predict(model, data["X"][idx])
         error = prediction - truth
@@ -81,10 +187,10 @@ def report_metrics(label, data, model, indices, constant=False):
                 r2=[float(v) if np.isfinite(v) else None for v in r2])
 
 def main():
-    path = Path(DATA_PATH) if DATA_PATH is not None else linear.find_dataset()
+    path = Path(DATA_PATH) if DATA_PATH is not None else find_dataset()
     print(f"Dataset: {path.resolve()}")
-    data = linear.load_dataset(path)
-    groups = linear.split_indices(data)
+    data = load_dataset(path)
+    groups = split_indices(data)
     # CORE CHANGE: use the recorded post-controller flag, which is exactly
     # reach_active for this action. Zero wheel speed is NOT a phase label.
     with np.load(path, allow_pickle=False) as archive:

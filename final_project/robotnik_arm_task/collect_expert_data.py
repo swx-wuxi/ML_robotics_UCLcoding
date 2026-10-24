@@ -35,7 +35,7 @@ ACTION_NAMES = ["wheel_FR", "wheel_FL", "wheel_BL", "wheel_BR"] + [
 
 
 # Target region in world coordinates. Initial robot states stay in the config.
-NUM_EPISODES = 1000
+NUM_EPISODES = 1500
 TARGET_CENTER_XY = (0.0, 0.0)
 TARGET_MIN_RADIUS = 0.9
 TARGET_MAX_RADIUS = 1.5
@@ -199,7 +199,7 @@ def main():
                         help="Target position in metres; repeat for multiple targets. "
                              "Otherwise sample the configured circular region")
     parser.add_argument("--episodes", type=int, default=NUM_EPISODES,
-                        help="Number of sampled targets (default: 1000)")
+                        help=f"Number of sampled targets (default: {NUM_EPISODES})")
     parser.add_argument("--max-steps", type=int, default=40000)
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--seed", type=int, default=42, help="Target sampling and episode split seed")
