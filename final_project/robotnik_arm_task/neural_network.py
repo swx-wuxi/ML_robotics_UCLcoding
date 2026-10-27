@@ -1,9 +1,10 @@
 """Lecture 6 style MLP baseline: independently train base and arm networks.
 
-Run: python neural_network.py, then select neural_network_model.npz in the evaluator.
+Run: python neural_network.py, then select neural_network_velocity_augmented.npz.
 Uses sklearn's Linear/ReLU MLP and Adam; evaluation requires only NumPy.
 """
 import copy
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
-MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_model.npz'
+MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_velocity_augmented.npz'
 HIDDEN_LAYERS = (128, 128)
 BATCH_SIZE = 4096
 MAX_EPOCHS = 100
@@ -24,6 +25,10 @@ PATIENCE = 10
 EARLY_STOPPING = True  # Stop on validation plateau when enabled.
 MIN_DELTA = 1e-5
 RANDOM_STATE = 42
+# Train-only augmentation: keep originals and add +/- velocity samples for one
+# randomly selected joint per row. Inputs stay 21D; the network stays unchanged.
+ARM_VELOCITY_AUGMENTATION = True
+ARM_VELOCITY_DELTAS = (0.01, 0.05)  # rad/s; choose one magnitude per original row.
 
 
 # Self-contained data/inference helpers; no auxiliary policy module imports.
@@ -151,7 +156,68 @@ def export_nn(estimator, xs, ys):
     return model
 
 
-def fit_nn(X, y, groups):
+def velocity_augmentation_settings(path):
+    if not ARM_VELOCITY_AUGMENTATION:
+        return None
+    metadata = json.loads((Path(path).parent / 'metadata.json').read_text())
+    source = ROOT / 'robotnik_arm_control.py'
+    expected = metadata.get('source_sha256', {}).get(source.name)
+    if expected is None or hashlib.sha256(source.read_bytes()).hexdigest() != expected:
+        raise ValueError('Expert controller differs from collection; verify the velocity-label law first')
+    kd = float(metadata['arm_params']['kd'])
+    limit = float(metadata['arm_params']['max_torque'])
+    deltas = np.asarray(ARM_VELOCITY_DELTAS, dtype=float)
+    if (not np.isfinite(kd) or kd <= 0 or not np.isfinite(limit) or limit <= 0
+            or deltas.ndim != 1 or not len(deltas)
+            or not np.isfinite(deltas).all() or np.any(deltas <= 0)):
+        raise ValueError('Invalid velocity augmentation settings')
+    return dict(kd=kd, max_torque=limit, deltas=deltas.tolist(),
+                seed=RANDOM_STATE + 1, original_samples_retained=True,
+                label_rule='tau_new = clip(tau_original - kd * delta_qd); '
+                           'only perturb a joint whose original torque is not saturated',
+                reference_policy='Same pose, target and pre-action expert reference; '
+                                 'velocity alone does not change expert IK/reference integration',
+                scaler_policy='Fit on original training rows only',
+                validation_test_policy='Original rows only; no augmentation')
+
+
+def augment_arm_velocity(X, y, rng, settings):
+    """Exact velocity-only expert labels without requiring FK or a simulator.
+
+    In the official expert, IK and q_ref integration do not depend on measured
+    qd. At fixed pose/reference, delta_tau = -kd*delta_qd before clipping.
+    A clipped source torque hides its pre-clip value, so NEVER perturb that
+    joint. Other joints may remain clipped because their inputs do not change.
+    """
+    X, y = np.asarray(X), np.asarray(y)
+    if X.ndim != 2 or X.shape[1] != 21 or y.shape != (len(X), 7):
+        raise ValueError('Velocity augmentation expects X=(N,21), y=(N,7)')
+    limit = settings['max_torque']
+    eligible = np.abs(y) < limit - 1e-5
+    rows = np.flatnonzero(eligible.any(axis=1))
+    if not len(rows):
+        return X.copy(), y.copy()
+    # Uniformly choose one eligible joint for each row; both signs use the same
+    # magnitude. No dense (dataset x 14) augmented array is ever allocated.
+    scores = rng.random((len(rows), 7))
+    scores[~eligible[rows]] = -1
+    joints = scores.argmax(axis=1)
+    delta = rng.choice(settings['deltas'], size=len(rows))
+    local = np.arange(len(rows))
+    parts_x, parts_y = [X], [y]
+    for sign in (1, -1):
+        xx, yy = X[rows].copy(), y[rows].copy()
+        xx[local, 11 + joints] += sign * delta
+        yy[local, joints] = np.clip(
+            yy[local, joints] - settings['kd'] * sign * delta, -limit, limit)
+        parts_x.append(xx)
+        parts_y.append(yy)
+    xx, yy = np.concatenate(parts_x), np.concatenate(parts_y)
+    order = rng.permutation(len(xx))
+    return xx[order], yy[order]
+
+
+def fit_nn(X, y, groups, augmentation=None):
     # CORE CHANGE: fit normalization on TRAIN ONLY, never on validation/test.
     xs, ys = StandardScaler(), StandardScaler()
     for idx in batches(groups['train']):
@@ -162,14 +228,23 @@ def fit_nn(X, y, groups):
                        alpha=WEIGHT_DECAY, batch_size=BATCH_SIZE,
                        shuffle=False, random_state=RANDOM_STATE)
     rng = np.random.default_rng(RANDOM_STATE)
+    augmentation_rng = np.random.default_rng(RANDOM_STATE + 1)
     best, best_loss, stale, history = None, np.inf, 0, []
     for epoch in range(MAX_EPOCHS):
         order = rng.permutation(groups['train'])
+        training_rows = 0
         for start in range(0, len(order), BATCH_SIZE):
             idx = order[start:start + BATCH_SIZE]
-            net.batch_size = len(idx)
-            net.partial_fit(xs.transform(X[idx]).astype(np.float32),
-                            ys.transform(y[idx]).astype(np.float32))
+            xb, yb = X[idx], y[idx]
+            if augmentation is not None:
+                xb, yb = augment_arm_velocity(xb, yb, augmentation_rng, augmentation)
+            # Preserve the actual optimizer minibatch size after adding rows.
+            for offset in range(0, len(xb), BATCH_SIZE):
+                xx, yy = xb[offset:offset+BATCH_SIZE], yb[offset:offset+BATCH_SIZE]
+                net.batch_size = len(xx)
+                net.partial_fit(xs.transform(xx).astype(np.float32),
+                                ys.transform(yy).astype(np.float32))
+            training_rows += len(xb)
         # CORE CHANGE: validation chooses the checkpoint; test is used only afterward.
         total, count = 0.0, 0
         for idx in batches(groups['validation']):
@@ -179,7 +254,9 @@ def fit_nn(X, y, groups):
         loss = float(total / count)
         if not np.isfinite(loss):
             raise ValueError('Non-finite validation loss')
-        history.append(dict(epoch=epoch + 1, validation_standardized_mse=loss))
+        history.append(dict(epoch=epoch + 1, validation_standardized_mse=loss,
+                            training_rows=training_rows,
+                            augmented_rows=training_rows - len(order)))
         print(f'Epoch {epoch + 1}/{MAX_EPOCHS}: validation MSE={loss:.6g}', flush=True)
         if loss < best_loss - MIN_DELTA:
             best, best_loss, stale = copy.deepcopy(net), loss, 0
@@ -257,9 +334,15 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
             codes[phases == name] = code
         X = base_features(X, codes)
     y = data['y'][:, 4:] if stage == 'arm' else data['y'][:, :4]
+    augmentation = velocity_augmentation_settings(path) if stage == 'arm' else None
     xs, ys = StandardScaler(), StandardScaler()
-    xt = xs.fit_transform(X[selected['train']]).astype(np.float32)
-    yt = ys.fit_transform(y[selected['train']]).astype(np.float32)
+    xt, yt = X[selected['train']], y[selected['train']]
+    xs.fit(xt)
+    ys.fit(yt)
+    original_train_samples = len(xt)
+    if augmentation is not None:
+        xt, yt = augment_arm_velocity(xt, yt, np.random.default_rng(RANDOM_STATE + 1), augmentation)
+    xt, yt = xs.transform(xt).astype(np.float32), ys.transform(yt).astype(np.float32)
     xv = xs.transform(X[selected['validation']]).astype(np.float32)
     yv = ys.transform(y[selected['validation']]).astype(np.float32)
     del data, X, y
@@ -270,7 +353,8 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
              Real(1e-4, 3e-3, prior='log-uniform', name='learning_rate'),
              Real(1e-6, 1e-2, prior='log-uniform', name='weight_decay'),
              Categorical([512, 1024, 2048, 4096], name='batch_size')]
-    output = ROOT / 'outputs' / f'bayesian_optimization_{stage}.json'
+    suffix = '_velocity_augmented' if augmentation is not None else ''
+    output = ROOT / 'outputs' / f'bayesian_optimization_{stage}{suffix}.json'
     output.parent.mkdir(parents=True, exist_ok=True)
     trials = []
 
@@ -308,6 +392,8 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
         result = dict(stage=stage, dataset=str(path.resolve()), seed=RANDOM_STATE,
                       objective='standardized validation MSE; no test selection',
                       train_samples=len(xt), validation_samples=len(xv),
+                      original_train_samples=original_train_samples,
+                      velocity_augmentation=augmentation,
                       trial_epochs=trial_epochs, early_stopping=EARLY_STOPPING,
                       best_parameters=winner['parameters'],
                       best_validation_mse=winner['validation_standardized_mse'], trials=trials)
@@ -330,6 +416,11 @@ def main():
     data = load_dataset(path)
     feature_names, action_names = data['feature_names'], data['action_names']
     groups = split_indices(data)
+    augmentation = velocity_augmentation_settings(path)
+    if augmentation is not None:
+        print('Arm training: originals + paired velocity perturbations '
+              f"{augmentation['deltas']} rad/s; kd={augmentation['kd']}; "
+              'validation/test unchanged.', flush=True)
     with np.load(path, allow_pickle=False) as archive:
         active = archive['nav_done_after']
     if active.shape != (len(data['X']),) or active.dtype.kind != 'b':
@@ -357,7 +448,8 @@ def main():
             print(f'{stage}/{name}: {len(idx)} samples', flush=True)
         X = base_features(data['X'], codes) if stage == 'base' else data['X']
         y = data['y'][:, outputs]
-        network, history = fit_nn(X, y, stage_groups)
+        network, history = fit_nn(X, y, stage_groups,
+                                 augmentation=augmentation if stage == 'arm' else None)
         validate_nn(network, n_features=8 if stage == 'base' else 21,
                     n_outputs=4 if stage == 'base' else 7)
         # Keep arm keys compatible with older NN archives; prefix base NN keys.
@@ -368,14 +460,16 @@ def main():
             print(f'{stage}/{name}')
             metrics[f'{stage}_{name}'] = report(network, X, y, idx, action_names[outputs])
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    model['arm_velocity_augmentation'] = np.asarray(json.dumps(augmentation))
     np.savez_compressed(MODEL_PATH, **model)
     output = ROOT / 'outputs'
     output.mkdir(parents=True, exist_ok=True)
-    (output / 'neural_network_metrics.json').write_text(json.dumps(dict(
+    (output / f'{MODEL_PATH.stem}_metrics.json').write_text(json.dumps(dict(
         model=str(MODEL_PATH), dataset=str(path.resolve()), architecture={'base': [8, *HIDDEN_LAYERS, 4], 'arm': [21, *HIDDEN_LAYERS, 7]},
         activation='relu', optimizer='adam', learning_rate=LEARNING_RATE,
         batch_size=BATCH_SIZE, max_epochs=MAX_EPOCHS, patience=PATIENCE,
         early_stopping=EARLY_STOPPING,
+        arm_velocity_augmentation=augmentation,
         weight_decay=WEIGHT_DECAY, seed=RANDOM_STATE, history=histories, metrics=metrics), indent=2)+'\n')
     print(f'Model saved: {MODEL_PATH}')
 
