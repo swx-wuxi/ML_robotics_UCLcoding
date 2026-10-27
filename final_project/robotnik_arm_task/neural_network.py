@@ -1,6 +1,6 @@
 """Lecture 6 style MLP baseline: independently train base and arm networks.
 
-Run: python neural_network.py, then select neural_network_velocity_angle_augmented.npz.
+Run: python neural_network.py, then select neural_network_near_target_augmented.npz.
 Uses sklearn's Linear/ReLU MLP and Adam; evaluation requires only NumPy.
 """
 import copy
@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
-MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_velocity_angle_augmented.npz'
+MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented.npz'
 HIDDEN_LAYERS = (128, 128)
 BATCH_SIZE = 4096
 MAX_EPOCHS = 100
@@ -34,6 +34,13 @@ ARM_ANGLE_DELTAS = (0.002, 0.005)  # rad; labels recomputed using the full exper
 ARM_ANGLE_EPISODE_LIMIT = 128  # Random successful TRAIN episodes to replay/cache.
 ARM_ANGLE_SAMPLES_PER_EPISODE = 64
 ARM_ANGLE_ROWS_PER_ORIGINAL = 0.5  # Extra angle rows mixed into each training epoch.
+ARM_NEAR_TARGET_AUGMENTATION = True
+ARM_NEAR_TARGET_ROWS_PER_ORIGINAL = 0.5  # Additional rows; keep baseline angle weight.
+ARM_NEAR_TARGET_SETTINGS = dict(
+    max_distance_m=0.05, max_joint_speed=0.1,
+    min_shift_m=0.005, max_shift_m=0.03,
+    min_angle_rad=0.005, max_angle_rad=0.02,
+    samples_per_episode=64, attempts=20)
 
 
 # Self-contained data/inference helpers; no auxiliary policy module imports.
@@ -227,12 +234,20 @@ def prepare_angle_pool(path, data, groups):
         return None, None
     if not np.isfinite(ARM_ANGLE_ROWS_PER_ORIGINAL) or ARM_ANGLE_ROWS_PER_ORIGINAL <= 0:
         raise ValueError('Angle sample ratio must be finite and positive')
+    if ARM_NEAR_TARGET_AUGMENTATION and (not np.isfinite(ARM_NEAR_TARGET_ROWS_PER_ORIGINAL)
+                                        or ARM_NEAR_TARGET_ROWS_PER_ORIGINAL <= 0):
+        raise ValueError('Near-target sample ratio must be finite and positive')
     from arm_angle_augmentation import load_or_build_angle_pool
     pool, info = load_or_build_angle_pool(
         path, np.unique(data['episode_id'][groups['train']]),
         deltas=ARM_ANGLE_DELTAS, episode_limit=ARM_ANGLE_EPISODE_LIMIT,
-        samples_per_episode=ARM_ANGLE_SAMPLES_PER_EPISODE, seed=RANDOM_STATE + 2)
-    info = dict(info, rows_per_original=ARM_ANGLE_ROWS_PER_ORIGINAL)
+        samples_per_episode=ARM_ANGLE_SAMPLES_PER_EPISODE, seed=RANDOM_STATE + 2,
+        near_target=ARM_NEAR_TARGET_SETTINGS if ARM_NEAR_TARGET_AUGMENTATION else None)
+    info = dict(info, rows_per_original=ARM_ANGLE_ROWS_PER_ORIGINAL,
+                near_target_rows_per_original=ARM_NEAR_TARGET_ROWS_PER_ORIGINAL
+                if ARM_NEAR_TARGET_AUGMENTATION else 0.)
+    print(f"Angle pool sample counts: {info.get('sample_counts')}; "
+          f"accepted near-target pairs: {info.get('accepted_near_pairs', 0)}", flush=True)
     return pool, info
 
 
@@ -240,7 +255,21 @@ def mix_angle_samples(X, y, original_count, pool, rng):
     if pool is None:
         return X, y, 0
     count = max(1, int(round(original_count * ARM_ANGLE_ROWS_PER_ORIGINAL)))
-    idx = rng.integers(len(pool['X']), size=count)
+    kinds = pool.get('sample_kind', np.zeros(len(pool['X']), dtype=np.int8))
+    single = np.flatnonzero(kinds == 0)
+    if not len(single):
+        raise ValueError('Angle pool is missing baseline single-joint samples')
+    idx = rng.choice(single, size=count, replace=True)
+    if ARM_NEAR_TARGET_AUGMENTATION:
+        # Balance original-velocity and zero-velocity multi-joint labels so the
+        # stationary-but-off-target states cannot be drowned out by other rows.
+        near = [np.flatnonzero(kinds == kind) for kind in (1, 2)]
+        if any(not len(indices) for indices in near):
+            raise ValueError('Near-target augmentation requires both velocity modes in the pool')
+        extra = max(2, int(round(original_count * ARM_NEAR_TARGET_ROWS_PER_ORIGINAL)))
+        idx = np.concatenate((idx, rng.choice(near[0], size=extra//2, replace=True),
+                              rng.choice(near[1], size=extra-extra//2, replace=True)))
+        count += extra
     xx = np.concatenate((X, pool['X'][idx]))
     yy = np.concatenate((y, pool['y'][idx]))
     order = rng.permutation(len(xx))
@@ -395,6 +424,8 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
     suffix = '_velocity_augmented' if augmentation is not None else ''
     if angle_pool is not None:
         suffix += '_angle_augmented'
+        if ARM_NEAR_TARGET_AUGMENTATION:
+            suffix += '_near_target'
     output = ROOT / 'outputs' / f'bayesian_optimization_{stage}{suffix}.json'
     output.parent.mkdir(parents=True, exist_ok=True)
     trials = []

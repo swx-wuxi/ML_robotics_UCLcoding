@@ -46,8 +46,7 @@ with quiet_native(stderr=True):
     import robotnik_arm_task as task
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EPISODE = ROOT/'evaluation/final_20261027T125844_550703Z/episode_0015.npz'
-
+DEFAULT_EPISODE = ROOT/'evaluation/final_20261027T171552_315325Z/episode_0001.npz'
 
 def predict(model, X):
     h = (np.asarray(X, dtype=np.float32)-model['nn_x_mean'])/model['nn_x_scale']
@@ -56,7 +55,6 @@ def predict(model, X):
         if i < 2:
             h = np.maximum(h, 0)
     return h*model['nn_y_scale']+model['nn_y_mean']
-
 
 def rollout(branch, source, settings, model, metadata, seconds):
     start = int(np.flatnonzero(source['control_phase']=='arm')[0])
