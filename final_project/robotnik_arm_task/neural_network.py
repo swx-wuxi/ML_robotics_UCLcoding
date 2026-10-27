@@ -1,6 +1,6 @@
 """Lecture 6 style MLP baseline: independently train base and arm networks.
 
-Run: python neural_network.py, then select neural_network_velocity_augmented.npz.
+Run: python neural_network.py, then select neural_network_velocity_angle_augmented.npz.
 Uses sklearn's Linear/ReLU MLP and Adam; evaluation requires only NumPy.
 """
 import copy
@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
-MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_velocity_augmented.npz'
+MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_velocity_angle_augmented.npz'
 HIDDEN_LAYERS = (128, 128)
 BATCH_SIZE = 4096
 MAX_EPOCHS = 100
@@ -29,6 +29,11 @@ RANDOM_STATE = 42
 # randomly selected joint per row. Inputs stay 21D; the network stays unchanged.
 ARM_VELOCITY_AUGMENTATION = True
 ARM_VELOCITY_DELTAS = (0.01, 0.05)  # rad/s; choose one magnitude per original row.
+ARM_ANGLE_AUGMENTATION = True
+ARM_ANGLE_DELTAS = (0.002, 0.005)  # rad; labels recomputed using the full expert.
+ARM_ANGLE_EPISODE_LIMIT = 128  # Random successful TRAIN episodes to replay/cache.
+ARM_ANGLE_SAMPLES_PER_EPISODE = 64
+ARM_ANGLE_ROWS_PER_ORIGINAL = 0.5  # Extra angle rows mixed into each training epoch.
 
 
 # Self-contained data/inference helpers; no auxiliary policy module imports.
@@ -217,7 +222,32 @@ def augment_arm_velocity(X, y, rng, settings):
     return xx[order], yy[order]
 
 
-def fit_nn(X, y, groups, augmentation=None):
+def prepare_angle_pool(path, data, groups):
+    if not ARM_ANGLE_AUGMENTATION:
+        return None, None
+    if not np.isfinite(ARM_ANGLE_ROWS_PER_ORIGINAL) or ARM_ANGLE_ROWS_PER_ORIGINAL <= 0:
+        raise ValueError('Angle sample ratio must be finite and positive')
+    from arm_angle_augmentation import load_or_build_angle_pool
+    pool, info = load_or_build_angle_pool(
+        path, np.unique(data['episode_id'][groups['train']]),
+        deltas=ARM_ANGLE_DELTAS, episode_limit=ARM_ANGLE_EPISODE_LIMIT,
+        samples_per_episode=ARM_ANGLE_SAMPLES_PER_EPISODE, seed=RANDOM_STATE + 2)
+    info = dict(info, rows_per_original=ARM_ANGLE_ROWS_PER_ORIGINAL)
+    return pool, info
+
+
+def mix_angle_samples(X, y, original_count, pool, rng):
+    if pool is None:
+        return X, y, 0
+    count = max(1, int(round(original_count * ARM_ANGLE_ROWS_PER_ORIGINAL)))
+    idx = rng.integers(len(pool['X']), size=count)
+    xx = np.concatenate((X, pool['X'][idx]))
+    yy = np.concatenate((y, pool['y'][idx]))
+    order = rng.permutation(len(xx))
+    return xx[order], yy[order], count
+
+
+def fit_nn(X, y, groups, augmentation=None, angle_pool=None):
     # CORE CHANGE: fit normalization on TRAIN ONLY, never on validation/test.
     xs, ys = StandardScaler(), StandardScaler()
     for idx in batches(groups['train']):
@@ -229,15 +259,19 @@ def fit_nn(X, y, groups, augmentation=None):
                        shuffle=False, random_state=RANDOM_STATE)
     rng = np.random.default_rng(RANDOM_STATE)
     augmentation_rng = np.random.default_rng(RANDOM_STATE + 1)
+    angle_rng = np.random.default_rng(RANDOM_STATE + 2)
     best, best_loss, stale, history = None, np.inf, 0, []
     for epoch in range(MAX_EPOCHS):
         order = rng.permutation(groups['train'])
         training_rows = 0
+        angle_rows = 0
         for start in range(0, len(order), BATCH_SIZE):
             idx = order[start:start + BATCH_SIZE]
             xb, yb = X[idx], y[idx]
             if augmentation is not None:
                 xb, yb = augment_arm_velocity(xb, yb, augmentation_rng, augmentation)
+            xb, yb, added = mix_angle_samples(xb, yb, len(idx), angle_pool, angle_rng)
+            angle_rows += added
             # Preserve the actual optimizer minibatch size after adding rows.
             for offset in range(0, len(xb), BATCH_SIZE):
                 xx, yy = xb[offset:offset+BATCH_SIZE], yb[offset:offset+BATCH_SIZE]
@@ -256,6 +290,8 @@ def fit_nn(X, y, groups, augmentation=None):
             raise ValueError('Non-finite validation loss')
         history.append(dict(epoch=epoch + 1, validation_standardized_mse=loss,
                             training_rows=training_rows,
+                            angle_augmented_rows=angle_rows,
+                            velocity_augmented_rows=training_rows - len(order) - angle_rows,
                             augmented_rows=training_rows - len(order)))
         print(f'Epoch {epoch + 1}/{MAX_EPOCHS}: validation MSE={loss:.6g}', flush=True)
         if loss < best_loss - MIN_DELTA:
@@ -335,6 +371,7 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
         X = base_features(X, codes)
     y = data['y'][:, 4:] if stage == 'arm' else data['y'][:, :4]
     augmentation = velocity_augmentation_settings(path) if stage == 'arm' else None
+    angle_pool, angle_info = prepare_angle_pool(path, data, groups) if stage == 'arm' else (None, None)
     xs, ys = StandardScaler(), StandardScaler()
     xt, yt = X[selected['train']], y[selected['train']]
     xs.fit(xt)
@@ -342,6 +379,8 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
     original_train_samples = len(xt)
     if augmentation is not None:
         xt, yt = augment_arm_velocity(xt, yt, np.random.default_rng(RANDOM_STATE + 1), augmentation)
+    xt, yt, _ = mix_angle_samples(xt, yt, original_train_samples, angle_pool,
+                                np.random.default_rng(RANDOM_STATE + 2))
     xt, yt = xs.transform(xt).astype(np.float32), ys.transform(yt).astype(np.float32)
     xv = xs.transform(X[selected['validation']]).astype(np.float32)
     yv = ys.transform(y[selected['validation']]).astype(np.float32)
@@ -354,6 +393,8 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
              Real(1e-6, 1e-2, prior='log-uniform', name='weight_decay'),
              Categorical([512, 1024, 2048, 4096], name='batch_size')]
     suffix = '_velocity_augmented' if augmentation is not None else ''
+    if angle_pool is not None:
+        suffix += '_angle_augmented'
     output = ROOT / 'outputs' / f'bayesian_optimization_{stage}{suffix}.json'
     output.parent.mkdir(parents=True, exist_ok=True)
     trials = []
@@ -394,6 +435,7 @@ def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
                       train_samples=len(xt), validation_samples=len(xv),
                       original_train_samples=original_train_samples,
                       velocity_augmentation=augmentation,
+                      angle_augmentation=angle_info,
                       trial_epochs=trial_epochs, early_stopping=EARLY_STOPPING,
                       best_parameters=winner['parameters'],
                       best_validation_mse=winner['validation_standardized_mse'], trials=trials)
@@ -417,6 +459,8 @@ def main():
     feature_names, action_names = data['feature_names'], data['action_names']
     groups = split_indices(data)
     augmentation = velocity_augmentation_settings(path)
+    # Prepare once before training; future runs reuse the source-keyed cache.
+    angle_pool, angle_info = prepare_angle_pool(path, data, groups)
     if augmentation is not None:
         print('Arm training: originals + paired velocity perturbations '
               f"{augmentation['deltas']} rad/s; kd={augmentation['kd']}; "
@@ -449,7 +493,8 @@ def main():
         X = base_features(data['X'], codes) if stage == 'base' else data['X']
         y = data['y'][:, outputs]
         network, history = fit_nn(X, y, stage_groups,
-                                 augmentation=augmentation if stage == 'arm' else None)
+                                 augmentation=augmentation if stage == 'arm' else None,
+                                 angle_pool=angle_pool if stage == 'arm' else None)
         validate_nn(network, n_features=8 if stage == 'base' else 21,
                     n_outputs=4 if stage == 'base' else 7)
         # Keep arm keys compatible with older NN archives; prefix base NN keys.
@@ -461,6 +506,7 @@ def main():
             metrics[f'{stage}_{name}'] = report(network, X, y, idx, action_names[outputs])
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     model['arm_velocity_augmentation'] = np.asarray(json.dumps(augmentation))
+    model['arm_angle_augmentation'] = np.asarray(json.dumps(angle_info))
     np.savez_compressed(MODEL_PATH, **model)
     output = ROOT / 'outputs'
     output.mkdir(parents=True, exist_ok=True)
@@ -470,6 +516,7 @@ def main():
         batch_size=BATCH_SIZE, max_epochs=MAX_EPOCHS, patience=PATIENCE,
         early_stopping=EARLY_STOPPING,
         arm_velocity_augmentation=augmentation,
+        arm_angle_augmentation=angle_info,
         weight_decay=WEIGHT_DECAY, seed=RANDOM_STATE, history=histories, metrics=metrics), indent=2)+'\n')
     print(f'Model saved: {MODEL_PATH}')
 

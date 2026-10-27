@@ -20,10 +20,10 @@ ROOT = Path(__file__).resolve().parent
 # ************************************************
 # Change the model weights here for comparison
 # ************************************************
-MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_velocity_augmented.npz"
-NUM_TARGETS = 50
+MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_velocity_angle_augmented.npz"
+NUM_TARGETS = 10
 TEST_SEED = 42 # 32 1 20261024
-USE_GUI = False
+USE_GUI = True
 PLAYBACK_SPEED = 1.0
 # Keep bounded commands, and save raw predictions separately for reproducibility.
 CLIP_COMMANDS = True
