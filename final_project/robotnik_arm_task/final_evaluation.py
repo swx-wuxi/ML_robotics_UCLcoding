@@ -18,9 +18,16 @@ import warnings
 
 ROOT = Path(__file__).resolve().parent
 # ************************************************
-# Change the model weights here for comparison
+# Change different models here for comparison
 # ************************************************
-MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
+
+MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
+# MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
+# MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_recovery_finetuned_20261028T183135_797512Z.npz"
+
+# ************************************************
+# Change different models here for comparison
+# ************************************************
 NUM_TARGETS = 100
 TEST_SEED = 20261024 # 32 1 20261024
 USE_GUI = False

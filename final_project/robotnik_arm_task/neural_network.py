@@ -1,7 +1,7 @@
 """Fine-tune the saved arm MLP while retaining the parent base network.
 
 Run: python neural_network.py to fine-tune the saved near-target model.
-Use --bayes for the separate random-initialization hyperparameter search (JSON only).
+Use --bayes to optimize recovery fine-tuning from the same parent weights.
 Uses sklearn's Linear/ReLU MLP and Adam; evaluation requires only NumPy.
 """
 import copy
@@ -18,12 +18,13 @@ from sklearn.preprocessing import StandardScaler
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
 BASELINE_MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented.npz'
+
 # Legacy fitting defaults; fine-tuning reads layer widths from the parent model.
-HIDDEN_LAYERS = (128, 64)
-BATCH_SIZE = 512
+HIDDEN_LAYERS = (128, 128)
+BATCH_SIZE = 4096
 MAX_EPOCHS = 100
-LEARNING_RATE = 0.0029947315126708438
-WEIGHT_DECAY = 9.094756592002128e-05
+LEARNING_RATE = 0.001
+WEIGHT_DECAY = 0.0001
 PATIENCE = 10
 EARLY_STOPPING = True  # Stop on validation plateau when enabled.
 MIN_DELTA = 1e-5
@@ -367,128 +368,131 @@ def report(model, X, y, indices, names):
                 r2=[float(v) if np.isfinite(v) else None for v in r2])
 
 
-def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=30,
-                      train_limit=100000, validation_limit=30000):
-    """Optional GP Bayesian search; never changes baseline globals or model files.
+def bayesian_optimize(stage='arm', n_calls=15, trial_epochs=15,
+                      train_limit=100000, validation_limit=30000, init_model=None):
+    """BO over the existing recovery fine-tuning workflow, not random training.
 
-    Search uses fixed train/validation subsets, train-only normalization and
-    standardized validation MSE. Test samples are never used for selection.
-    Returns/saves best *observed* parameters; retrain and evaluate separately.
-    Example: python neural_network.py --bayes --stage arm --trials 15
+    Same parent, frozen scalers/base, data pools and random seeds in every trial.
+    Save a separate best candidate and JSON; never overwrite the parent.
     """
     from skopt import gp_minimize
-    from skopt.space import Categorical, Real
+    from skopt.space import Real
+    from arm_recovery_data import load_or_build_recovery_pool, DEFAULT_SETTINGS
 
-    if stage not in ('base', 'arm'):
-        raise ValueError('stage must be base or arm')
+    global FINETUNE_LEARNING_RATE, WEIGHT_DECAY
+    global FINETUNE_RECOVERY_ROWS_PER_ORIGINAL, FINETUNE_EPOCHS
+    global FINETUNE_ORIGINAL_ROWS_PER_EPOCH
+
+    if stage != 'arm':
+        raise ValueError('Recovery BO supports --stage arm only; base stays frozen')
     if min(n_calls, trial_epochs, train_limit, validation_limit) < 1:
-        raise ValueError('Trial counts, epochs and sample limits must be positive')
-    path = Path(DATA_PATH) if DATA_PATH is not None else find_dataset()
+        raise ValueError('Trial counts and sample limits must be positive')
+    source = Path(init_model or BASELINE_MODEL_PATH).resolve()
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    with np.load(source, allow_pickle=False) as archive:
+        parent = {k: archive[k] for k in archive.files}
+    if (str(parent['model_type'].item()) != 'staged_neural_network'
+            or int(parent.get('arm_window_steps', 1)) != 1):
+        raise ValueError('BO requires a single-frame staged MLP parent')
+    validate_nn(parent, n_features=21, n_outputs=7)
+    path = Path(str(parent['dataset_path'].item()))
+    if DATA_PATH is not None and Path(DATA_PATH).resolve() != path.resolve():
+        raise ValueError('BO dataset must match parent')
     data = load_dataset(path)
+    for key in ('feature_names', 'action_names'):
+        if not np.array_equal(data[key], parent[key]):
+            raise ValueError('Parent/dataset feature or action order mismatch')
     groups = split_indices(data)
     with np.load(path, allow_pickle=False) as archive:
         active = archive['nav_done_after']
-        phases = archive['phase_after'] if stage == 'base' else None
     if active.shape != (len(data['X']),) or active.dtype.kind != 'b':
-        raise ValueError('Invalid stage labels')
-    mask = active if stage == 'arm' else ~active
+        raise ValueError('Invalid arm stage labels')
+    train_ids = groups['train'][active[groups['train']]]
+    validation_ids = groups['validation'][active[groups['validation']]]
+    if not len(train_ids) or not len(validation_ids):
+        raise ValueError('Empty arm train/validation split')
     rng = np.random.default_rng(RANDOM_STATE)
-    selected = {}
-    for name, limit in (('train', train_limit), ('validation', validation_limit)):
-        indices = groups[name][mask[groups[name]]]
-        if not len(indices):
-            raise ValueError(f'No {stage}/{name} samples')
-        # The same subset is reused across trials for comparable scores.
-        selected[name] = np.sort(rng.choice(indices, min(limit, len(indices)), replace=False))
-    X = data['X']
-    if stage == 'base':
-        if phases.shape != active.shape or not np.isin(phases, list(PHASE_CODES)).all():
-            raise ValueError('Invalid navigation phases')
-        codes = np.zeros(len(active), dtype=np.int8)
-        for name, code in PHASE_CODES.items():
-            codes[phases == name] = code
-        X = base_features(X, codes)
-    y = data['y'][:, 4:] if stage == 'arm' else data['y'][:, :4]
-    augmentation = velocity_augmentation_settings(path) if stage == 'arm' else None
-    angle_pool, angle_info = prepare_angle_pool(path, data, groups) if stage == 'arm' else (None, None)
-    xs, ys = StandardScaler(), StandardScaler()
-    xt, yt = X[selected['train']], y[selected['train']]
-    xs.fit(xt)
-    ys.fit(yt)
-    original_train_samples = len(xt)
-    if augmentation is not None:
-        xt, yt = augment_arm_velocity(xt, yt, np.random.default_rng(RANDOM_STATE + 1), augmentation)
-    xt, yt, _ = mix_angle_samples(xt, yt, original_train_samples, angle_pool,
-                                np.random.default_rng(RANDOM_STATE + 2))
-    xt, yt = xs.transform(xt).astype(np.float32), ys.transform(yt).astype(np.float32)
-    xv = xs.transform(X[selected['validation']]).astype(np.float32)
-    yv = ys.transform(y[selected['validation']]).astype(np.float32)
-    del data, X, y
-
-    # CORE CHANGE: GP surrogate + Expected Improvement chooses new trials.
-    # Two hidden layers and ReLU/Adam stay fixed to preserve baseline inference.
-    space = [Categorical(['64,64', '128,64', '128,128', '256,128', '256,256'], name='hidden_layers'),
-             Real(1e-4, 3e-3, prior='log-uniform', name='learning_rate'),
-             Real(1e-6, 1e-2, prior='log-uniform', name='weight_decay'),
-             Categorical([512, 1024, 2048, 4096], name='batch_size')]
-    suffix = '_velocity_augmented' if augmentation is not None else ''
-    if angle_pool is not None:
-        suffix += '_angle_augmented'
-        if ARM_NEAR_TARGET_AUGMENTATION:
-            suffix += '_near_target'
-    output = ROOT / 'outputs' / f'bayesian_optimization_{stage}{suffix}.json'
+    validation_ids = np.sort(rng.choice(validation_ids,
+        min(validation_limit, len(validation_ids)), replace=False))
+    recovery_train, train_info = load_or_build_recovery_pool(
+        path, np.unique(data['episode_id'][groups['train']]), 0)
+    recovery_validation, val_info = load_or_build_recovery_pool(
+        path, np.unique(data['episode_id'][groups['validation']]), 1,
+        settings=dict(DEFAULT_SETTINGS, episodes=8), seed=RANDOM_STATE+4)
+    if set(recovery_train['parent_episode']) & set(recovery_validation['parent_episode']):
+        raise ValueError('Recovery train/validation overlap')
+    angle_pool, angle_info = prepare_angle_pool(path, data, groups)
+    augmentation = velocity_augmentation_settings(path)
+    # Small search: step size, regularization, and recovery-vs-nominal balance.
+    space = [Real(1e-5, 2e-4, prior='log-uniform', name='finetune_learning_rate'),
+             Real(1e-6, 1e-3, prior='log-uniform', name='weight_decay'),
+             Real(.25, 2., prior='log-uniform', name='recovery_rows_per_original')]
+    original = (FINETUNE_LEARNING_RATE, WEIGHT_DECAY,
+                FINETUNE_RECOVERY_ROWS_PER_ORIGINAL, FINETUNE_EPOCHS,
+                FINETUNE_ORIGINAL_ROWS_PER_EPOCH)
+    baseline = list(original[:3])
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
+    model_output = source.parent / f'neural_network_bo_recovery_{stamp}.npz'
+    output = ROOT / 'outputs' / f'bayesian_optimization_recovery_{stamp}.json'
     output.parent.mkdir(parents=True, exist_ok=True)
     trials = []
+    best_score = 1.
+    best_parameters = None
+    best_epoch = 0
+    # Epoch zero remains a valid fallback if every trial fails to improve.
+    np.savez_compressed(model_output, **parent)
+    print(f'BO parent: {source}\nBO candidate: {model_output}\nBO results: {output}', flush=True)
 
     def objective(values):
-        layers, lr, alpha, batch = values
-        params = dict(hidden_layers=[int(v) for v in layers.split(',')],
-                      learning_rate=float(lr), weight_decay=float(alpha), batch_size=int(batch))
-        net = MLPRegressor(hidden_layer_sizes=tuple(params['hidden_layers']),
-                           activation='relu', solver='adam', learning_rate_init=float(lr),
-                           alpha=float(alpha), batch_size=int(batch), shuffle=False,
-                           random_state=RANDOM_STATE)
-        order_rng = np.random.default_rng(RANDOM_STATE)
-        best, stale, best_epoch = np.inf, 0, 0
-        print(f'Bayes trial {len(trials)+1}/{n_calls}: {params}', flush=True)
-        for epoch in range(trial_epochs):
-            order = order_rng.permutation(len(xt))
-            for start in range(0, len(order), int(batch)):
-                idx = order[start:start+int(batch)]
-                net.batch_size = len(idx)
-                net.partial_fit(xt[idx], yt[idx])
-            score = float(np.mean((net.predict(xv) - yv)**2))
-            if not np.isfinite(score):
-                raise ValueError('Non-finite Bayesian trial loss')
-            if score < best - MIN_DELTA:
-                best, stale, best_epoch = score, 0, epoch + 1
-            else:
-                stale += 1
-            print(f'  epoch {epoch+1}/{trial_epochs}: validation MSE={score:.6g}', flush=True)
-            if EARLY_STOPPING and stale >= PATIENCE:
-                break
-        trials.append(dict(parameters=params, validation_standardized_mse=best,
-                           best_epoch=best_epoch, epochs_run=epoch+1))
-        winner = min(trials, key=lambda trial: trial['validation_standardized_mse'])
-        # Persist every completed trial so a long search remains reviewable.
-        result = dict(stage=stage, dataset=str(path.resolve()), seed=RANDOM_STATE,
-                      objective='standardized validation MSE; no test selection',
-                      train_samples=len(xt), validation_samples=len(xv),
-                      original_train_samples=original_train_samples,
-                      velocity_augmentation=augmentation,
-                      angle_augmentation=angle_info,
-                      trial_epochs=trial_epochs, early_stopping=EARLY_STOPPING,
-                      best_parameters=winner['parameters'],
-                      best_validation_mse=winner['validation_standardized_mse'], trials=trials)
+        nonlocal best_score, best_parameters, best_epoch
+        global FINETUNE_LEARNING_RATE, WEIGHT_DECAY
+        global FINETUNE_RECOVERY_ROWS_PER_ORIGINAL
+        FINETUNE_LEARNING_RATE, WEIGHT_DECAY, FINETUNE_RECOVERY_ROWS_PER_ORIGINAL = map(float, values)
+        params = dict(zip((dimension.name for dimension in space), map(float, values)))
+        print(f'BO trial {len(trials)+1}/{n_calls}: {params}', flush=True)
+        # finetune_arm initializes a fresh Adam state from the SAME parent each time.
+        candidate, metrics = finetune_arm(parent, data['X'], data['y'][:, 4:11],
+            train_ids, validation_ids, recovery_train, recovery_validation,
+            augmentation=augmentation, angle_pool=angle_pool)
+        selected = [row for row in metrics['history'] if row['selected']][-1]
+        score = float(selected['score'])
+        trials.append(dict(parameters=params, score=score,
+                           best_epoch=metrics['best_epoch'], history=metrics['history']))
+        if score < best_score - MIN_DELTA:
+            best_score, best_parameters, best_epoch = score, params, metrics['best_epoch']
+            for key in parent:
+                if key.startswith('base_') or key in ('nn_x_mean', 'nn_x_scale', 'nn_y_mean', 'nn_y_scale'):
+                    np.testing.assert_array_equal(candidate[key], parent[key])
+            candidate['bo_config'] = np.asarray(json.dumps(dict(
+                parent_model=str(source), parent_sha256=digest, parameters=params,
+                best_epoch=best_epoch, score=score, seed=RANDOM_STATE)))
+            np.savez_compressed(model_output, **candidate)
+        result = dict(parent_model=str(source), parent_sha256=digest,
+            model=str(model_output), dataset=str(path), seed=RANDOM_STATE,
+            objective='Equal nominal/recovery validation MSE ratios; nominal degradation <=10%; parent score=1. Not closed-loop success.',
+            best_score=best_score, best_parameters=best_parameters, best_epoch=best_epoch,
+            parent_retained=best_parameters is None, baseline_parameters=baseline,
+            trial_epochs=trial_epochs, batch_size=BATCH_SIZE,
+            original_rows_per_epoch=min(train_limit, len(train_ids)),
+            validation_samples=len(validation_ids), recovery_training=train_info,
+            recovery_validation=val_info, angle_augmentation=angle_info,
+            velocity_augmentation=augmentation, trials=trials)
         output.write_text(json.dumps(result, indent=2)+'\n')
-        return best
+        return score
 
-    baseline = ['128,128', 0.001, 0.0001, 4096]
-    gp_minimize(objective, space, x0=baseline, n_calls=n_calls,
-                n_initial_points=min(4, n_calls-1), acq_func='EI',
-                random_state=RANDOM_STATE)
+    try:
+        FINETUNE_EPOCHS = trial_epochs
+        FINETUNE_ORIGINAL_ROWS_PER_EPOCH = min(train_limit, len(train_ids))
+        gp_minimize(objective, space, x0=baseline, n_calls=n_calls,
+                    n_initial_points=min(4, n_calls-1), acq_func='EI',
+                    random_state=RANDOM_STATE)
+    finally:
+        (FINETUNE_LEARNING_RATE, WEIGHT_DECAY,
+         FINETUNE_RECOVERY_ROWS_PER_ORIGINAL, FINETUNE_EPOCHS,
+         FINETUNE_ORIGINAL_ROWS_PER_EPOCH) = original
+        assert hashlib.sha256(source.read_bytes()).hexdigest() == digest
     result = json.loads(output.read_text())
-    print(f"Best observed parameters: {result['best_parameters']}\nResults: {output}")
+    print(f"BO complete: score={best_score:.6g}; parameters={best_parameters}\nModel: {model_output}\nResults: {output}")
     return result
 
 
@@ -671,16 +675,16 @@ def finetune_main(init_model=None):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--bayes', action='store_true', help='Search only; do not overwrite model weights')
+    parser.add_argument('--bayes', action='store_true', help='BO of arm recovery fine-tuning; save separate best candidate')
     parser.add_argument('--init-model', type=Path, default=BASELINE_MODEL_PATH, help='Parent NPZ for default arm-only fine-tuning')
     parser.add_argument('--stage', choices=['base', 'arm'], default='arm')
     parser.add_argument('--trials', type=int, default=15)
-    parser.add_argument('--trial-epochs', type=int, default=30)
+    parser.add_argument('--trial-epochs', type=int, default=15)
     parser.add_argument('--train-limit', type=int, default=100000)
     parser.add_argument('--validation-limit', type=int, default=30000)
     args = parser.parse_args()
     if args.bayes:
         bayesian_optimize(args.stage, args.trials, args.trial_epochs,
-                          args.train_limit, args.validation_limit)
+                          args.train_limit, args.validation_limit, args.init_model)
     else:
         finetune_main(args.init_model)
