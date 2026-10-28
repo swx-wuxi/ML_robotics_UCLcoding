@@ -46,7 +46,7 @@ with quiet_native(stderr=True):
     import robotnik_arm_task as task
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EPISODE = ROOT/'evaluation/final_20261027T171552_315325Z/episode_0001.npz'
+DEFAULT_EPISODE = ROOT/'evaluation/final_20261027T171552_315325Z/episode_0002.npz'
 
 def predict(model, X):
     h = (np.asarray(X, dtype=np.float32)-model['nn_x_mean'])/model['nn_x_scale']

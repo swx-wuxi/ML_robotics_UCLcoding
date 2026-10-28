@@ -135,3 +135,33 @@ and a post-action final EE distance below 0.01 m. `official_success_rate` is als
 reported separately. Stalls and timeouts count as failures; an aborted batch is
 marked incomplete. These fresh targets test generalization within the sampled
 region, not new heights or new initial conditions.
+
+## Recovery fine-tuning (current default)
+
+```bash
+RoboEnv/.pixi/envs/default/bin/python final_project/robotnik_arm_task/neural_network.py
+```
+
+The default now loads `neural_network_near_target_augmented.npz`, copies a backup,
+and fine-tunes only the arm using a new Adam optimizer at `5e-5`. Base weights and
+all parent normalization arrays stay fixed. The parent NPZ is never overwritten;
+a timestamped `neural_network_recovery_finetuned_*.npz` contains the candidate.
+Use `--init-model PATH` to choose another compatible parent. `--from-scratch`
+retains the earlier workflow and saves `neural_network_near_target_retrained.npz`.
+
+Recovery data uses disjoint original train/validation target groups (32/8 episodes
+by default), never evaluation targets. Each fresh simulator replays the recorded
+expert to a near-target state, checks reproduction, physically applies a small
+multi-joint pose disturbance and stationary/toward/away velocity, then runs the
+official expert for 3 seconds. Its saved pre-action reference is retained. Only
+recovery trials with a settled 0.25-second hold within 1 cm contribute labels.
+Full recoveries are cached at 100 Hz, including braking and target holding.
+Training mixes these rows with original samples and existing augmentations.
+
+Model selection compares nominal and recovery validation MSE relative to the
+parent, with a 10% nominal-MSE degradation limit. Epoch zero remains a candidate,
+so if no checkpoint improves this offline criterion the output retains the parent
+arm weights. This does not certify better closed-loop success: compare the saved
+candidate against the parent in the evaluator using unchanged task criteria.
+`outputs/recovery_finetune_*/` records provenance, validation history and recovery
+trial summaries. Recovery caches live in `data/augmentation_cache/`.
