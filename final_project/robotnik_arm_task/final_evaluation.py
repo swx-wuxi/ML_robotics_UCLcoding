@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 # ************************************************
 # Change different models here for comparison
 # ************************************************
-
+# MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_model.npz"
 MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_recovery_finetuned_20261028T183135_797512Z.npz"
@@ -29,7 +29,7 @@ MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028
 # Change different models here for comparison
 # ************************************************
 NUM_TARGETS = 100
-TEST_SEED = 20261024 # 32 1 20261024
+TEST_SEED = 42 # 42 1 20261024
 USE_GUI = False
 PLAYBACK_SPEED = 1.0
 # Keep bounded commands, and save raw predictions separately for reproducibility.
