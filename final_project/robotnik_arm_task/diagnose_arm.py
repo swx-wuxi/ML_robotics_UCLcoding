@@ -1,7 +1,7 @@
 """Generate only four expert/MLP comparison PNGs for the recorded episode.
 
 RoboEnv/.pixi/envs/default/bin/python final_project/robotnik_arm_task/compare_episode_arm.py
-Default duration matches the recorded arm phase; --seconds overrides it.
+Rollouts cover the first 5 seconds after arm activation.
 Navigation replays recorded commands. Original NPZ lacks the full hidden physics
 state; reconstructed full start states are checked equal between fresh worlds.
 """
@@ -46,7 +46,8 @@ with quiet_native(stderr=True):
     import robotnik_arm_task as task
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_EPISODE = ROOT/'evaluation/final_20261029T194112_590396Z/episode_0002.npz'
+ARM_WINDOW_S = 5.0
+DEFAULT_EPISODE = ROOT/'evaluation/final_20261031T230639_874949Z/episode_0002.npz'
 
 def predict(model, X):
     h = (np.asarray(X, dtype=np.float32)-model['nn_x_mean'])/model['nn_x_scale']
@@ -56,7 +57,7 @@ def predict(model, X):
             h = np.maximum(h, 0)
     return h*model['nn_y_scale']+model['nn_y_mean']
 
-def rollout(branch, source, settings, model, metadata, seconds):
+def rollout(branch, source, settings, model, metadata):
     start = int(np.flatnonzero(source['control_phase']=='arm')[0])
     target = source['target']
     sim = task.pb.SimInterface('robotnik_arm.json', conf_file_path_ext=str(ROOT), use_gui=False)
@@ -120,7 +121,7 @@ def rollout(branch, source, settings, model, metadata, seconds):
         joints = c.getJointStates(rid, list(range(c.getNumJoints(rid))))
         physical = np.concatenate((pos, quat, lin, ang,
                                    np.asarray([(j[0], j[1]) for j in joints]).ravel()))
-        count = len(source['X'])-start if seconds is None else int(np.ceil(seconds/dt))
+        count = int(np.ceil(ARM_WINDOW_S/dt))
         rows, torques = [], []
         for k in range(count+1):
             X, ee, qp = measure()
@@ -151,6 +152,7 @@ def rollout(branch, source, settings, model, metadata, seconds):
 def plots(traces, target, out):
     colors = dict(expert='tab:blue', mlp='tab:orange')
     fig, axes = plt.subplots(7, 2, figsize=(12, 16), sharex=True)
+    fig.suptitle('Baseline - Joint Angles and Velocities', fontsize=24, fontweight='bold')
     for j in range(7):
         for name, d in traces.items():
             axes[j, 0].plot(d['time'], d['X'][:, 4+j], label=name, color=colors[name])
@@ -165,6 +167,7 @@ def plots(traces, target, out):
     fig.tight_layout(); fig.savefig(out/'joint_angle_velocity.png', dpi=150); plt.close(fig)
 
     fig, axes = plt.subplots(7, 1, figsize=(11, 15), sharex=True)
+    fig.suptitle('Baseline - Joint Torques', fontsize=24, fontweight='bold')
     for j, ax in enumerate(axes):
         for name, d in traces.items():
             ax.plot(d['time'][:-1], d['torque'][:, j], label=name, color=colors[name])
@@ -174,6 +177,7 @@ def plots(traces, target, out):
     fig.tight_layout(); fig.savefig(out/'joint_torque.png', dpi=150); plt.close(fig)
 
     fig = plt.figure(figsize=(9, 8)); ax = fig.add_subplot(111, projection='3d')
+    fig.suptitle('Baseline - End-Effector 3D Path', fontsize=24, fontweight='bold')
     for name, d in traces.items():
         ax.plot(*d['ee'].T, label=name, color=colors[name])
         ax.scatter(*d['ee'][-1], color=colors[name], marker='x', s=60)
@@ -190,6 +194,7 @@ def plots(traces, target, out):
     fig.tight_layout(); fig.savefig(out/'ee_path_3d.png', dpi=150); plt.close(fig)
 
     fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+    fig.suptitle('Baseline - Distance to Target', fontsize=24, fontweight='bold')
     for name, d in traces.items():
         error = np.linalg.norm(d['ee']-target, axis=1)*100
         for ax in axes:
@@ -205,11 +210,8 @@ def plots(traces, target, out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--episode', type=Path, default=DEFAULT_EPISODE)
-    parser.add_argument('--seconds', type=float)
     parser.add_argument('--output', type=Path)
     args = parser.parse_args()
-    if args.seconds is not None and (not np.isfinite(args.seconds) or args.seconds <= 0):
-        parser.error('seconds must be finite and positive')
     settings = json.loads((args.episode.parent/'settings.json').read_text())
     model_path = Path(settings['model'])
     if hashlib.sha256(model_path.read_bytes()).hexdigest() != settings['model_sha256']:
@@ -221,7 +223,7 @@ def main():
     metadata = json.loads((Path(str(model['dataset_path'].item())).parent/'metadata.json').read_text())
     with np.load(args.episode, allow_pickle=False) as a:
         source = {k:a[k] for k in a.files}
-    traces = {name:rollout(name, source, settings, model, metadata, args.seconds) for name in ('expert', 'mlp')}
+    traces = {name:rollout(name, source, settings, model, metadata) for name in ('expert', 'mlp')}
     np.testing.assert_array_equal(traces['expert']['initial'], traces['mlp']['initial'])
     np.testing.assert_array_equal(traces['expert']['X'][0], traces['mlp']['X'][0])
     out = args.output or ROOT/'diagnostics'/datetime.now(timezone.utc).strftime('arm_plots_%Y%m%dT%H%M%S_%fZ')

@@ -106,8 +106,11 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
     kinds, shifts = [], []  # 0: single; 1: multi/original velocity; 2: multi/zero velocity
     attempted_near_pairs = accepted_near_pairs = 0
     max_state_error = max_torque_error = 0.
+
+    # ******* Deal with randomly selected expert
     for number, episode_id in enumerate(selected, 1):
         episode_path = dataset.parent/f'episode_{episode_id:04d}.npz'
+        # Read the original expert data and check
         with np.load(episode_path, allow_pickle=False) as a:
             expected_X, expected_y = a['X'], a['y'][:, 4:11]
             active, expected_ref = a['nav_done_after'], a['q_ref_before']
@@ -159,41 +162,56 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
             found.add(current)
             limited = np.asarray(lower) < np.asarray(upper)
 
+            # Check joints that can be disturbed
             def eligible_joints(delta):
                 return np.flatnonzero(~limited | ((q-delta >= np.asarray(lower)+params.limit_margin) &
                                                    (q+delta <= np.asarray(upper)-params.limit_margin)))
 
+            # *****In selected timestamps add velocity and angle offset****
             def emit(offset, multi=False):
-                # Both signs must stay in the desired Cartesian band. Reject the
-                # whole pair rather than silently biasing sampling to one sign.
                 poses = []
+                # Check both symmetric joint perturbations: q + offset and q - offset.
                 for sign in (1, -1):
-                    qq = q + sign*offset
+                    qq = q + sign*offset   # posture aug
+                    # Reject the pair if a moved joint crosses its safety margin.
                     if np.any(limited & ((qq < np.asarray(lower)+params.limit_margin) |
                                           (qq > np.asarray(upper)-params.limit_margin))):
-                        # Unchanged joints may already lie outside the margin;
-                        # only the perturbed joints must respect it.
                         moved = offset != 0
                         if np.any(moved & limited & ((qq < np.asarray(lower)+params.limit_margin) |
                                                      (qq > np.asarray(upper)-params.limit_margin))):
                             return False
+                    # Recompute FK to find the EE position at this perturbed pose.
                     perturbed = qp.copy(); perturbed[7:14] = qq
                     task.pin.forwardKinematics(dyn.pin_model, dyn.pin_data, perturbed)
                     task.pin.updateFramePlacements(dyn.pin_model, dyn.pin_data)
                     ee_new = dyn.pin_data.oMf[frame].translation.copy()
                     shift = float(np.linalg.norm(ee_new-ee))
+                    # For near-target samples, require the configured EE displacement
+                    # from the original pose (not the distance to the target).
                     if multi and not near_target['min_shift_m'] <= shift <= near_target['max_shift_m']:
                         return False
                     poses.append((qq, perturbed, ee_new, shift))
+
+                # Both signs passed validation; generate labels for each pose.
                 for qq, perturbed, ee_new, shift in poses:
+                    # Ordinary samples keep the original velocity. 
+                    # Near-target samples use both original velocity and zero velocity.
+                    
                     modes = ((qd.copy(), 1), (np.zeros(7), 2)) if multi else ((qd.copy(), 0),)
+                    # generate torque labels relevantly
                     for velocity, kind in modes:
                         # Restore FK for this exact pose before each expert query.
                         task.pin.forwardKinematics(dyn.pin_model, dyn.pin_data, perturbed)
                         task.pin.updateFramePlacements(dyn.pin_model, dyn.pin_data)
+                        
+                        # Copy the pre-action reference so queries do not advance
+                        # the reference used by the replayed expert trajectory.
                         torque, _, _ = official(dyn, perturbed, qq.copy(), velocity,
                             reference.copy(), hold.copy(), target.copy(), ee_new.copy(),
                             frame, shoulder, lower, upper, dt, params, reach_active=True)
+                        
+                        # Save the perturbed observation and its matching label,
+                        # together with provenance and the sample category.
                         xx = x.copy(); xx[4:11] = qq; xx[11:18] = velocity
                         xs.append(xx); ys.append(torque.copy())
                         parents.append(episode_id); parent_rows.append(current)
@@ -207,6 +225,8 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
                     if len(joints):
                         offset = np.zeros(7); offset[int(rng.choice(joints))] = delta
                         emit(offset)
+
+                # 
                 if current in near_centers:
                     joints = eligible_joints(near_target['max_angle_rad'])
                     if len(joints) >= 2:

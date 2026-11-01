@@ -17,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
-BASELINE_MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented.npz'
+BASELINE_MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented01.npz'
 
 # Legacy fitting defaults; fine-tuning reads layer widths from the parent model.
 HIDDEN_LAYERS = (128, 128)

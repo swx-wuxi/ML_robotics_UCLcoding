@@ -152,19 +152,31 @@ def plot(result, action_names, output):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    # Report titles are edited here directly; no title arguments are needed.
+    titles = {
+        'base': ('Offline Evaluation of Wheel Velocity Predictions(Baseline)',
+                 '(a) Wheel Velocity Prediction Error (RMSE)',
+                 '(b) Wheel Velocity Goodness of Fit (R²)'),
+        'arm': ('Offline Evaluation of Joint Torque Predictions (Baseline)',
+                '(a) Joint Torque Prediction Error (RMSE)',
+                '(b) Joint Torque Goodness of Fit (R²)'),
+    }
     for stage, splits in result['metrics'].items():
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
         names = action_names[:4] if stage == 'base' else action_names[4:11]
         for col, metric in enumerate(('rmse', 'r2')):
             ax = axes[col]
             for split, item in splits.items():
                 ax.plot(names, item[metric], marker='o', label={'validation': 'valid'}.get(split, split))
-            ax.set_title(f'{stage.upper()} {metric.upper()}')
-            ax.set_ylabel(result['units'][stage]['rmse'] if metric == 'rmse' else 'R² (dimensionless)')
+            ax.set_title(titles[stage][col + 1], fontsize=13, pad=12)
+            ax.set_xlabel('Wheel output channel' if stage == 'base' else 'Joint output channel')
+            ax.set_ylabel(f"RMSE ({result['units'][stage]['rmse']})" if metric == 'rmse' else 'R² (dimensionless)')
             ax.tick_params(axis='x', rotation=30)
             ax.legend()
             ax.grid(alpha=.3)
-        fig.suptitle(f'{stage.upper()} final-model metrics (original rows; x = output channel)')
+        fig.suptitle(titles[stage][0], fontsize=20, fontweight='bold')
+        fig.supxlabel('Final model evaluated on original training, validation and test samples',
+                      fontsize=10)
         fig.savefig(output / f'{stage}_rmse_r2.png', dpi=200)
         plt.close(fig)
 

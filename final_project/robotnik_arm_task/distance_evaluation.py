@@ -10,9 +10,9 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent
 # Edit these folders to compare other saved runs. Targets must match.
 RUNS = {
-    'baseline': ROOT / 'evaluation/final_20261029T174215_772977Z',
-    'velocity_angle': ROOT / 'evaluation/final_20261028T184902_804523Z',
-    'best_model': ROOT / 'evaluation/final_20261028T173354_733906Z',
+    'baseline': ROOT / 'evaluation/final_20261031T230639_874949Z',
+    'velocity_angle': ROOT / 'evaluation/final_20261031T231931_320110Z',
+    'best_model': ROOT / 'evaluation/final_20261029T194112_590396Z',
 }
 ARM_WINDOW_S = 5.0
 
@@ -131,17 +131,23 @@ def main():
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
     for name, values in curves.items():
         axes[0].plot(grid, values.mean(axis=0)*1000, label=name)
         axes[1].plot(grid, np.mean(values**2, axis=0), label=name)
+    # Report titles are written directly here for easy editing.
+    axes[0].set_title('(a) Mean End-Effector Distance to Target', fontsize=13, pad=12)
+    axes[1].set_title('(b) Mean Squared End-Effector Distance to Target', fontsize=13, pad=12)
     axes[0].set_ylabel('Mean EE-target distance (mm)')
     axes[1].set_ylabel('Mean squared EE-target distance (m²)')
     for ax in axes:
         ax.set_xlabel('Time since Arm activation (s)'); ax.grid(alpha=.3)
         if curves:
             ax.legend()
-    fig.suptitle(f'Paired targets with complete {args.window:g}s Arm traces: n={len(eligible)}')
+    fig.suptitle('Closed-Loop Comparison of End-Effector Reaching Performance',
+                 fontsize=20, fontweight='bold')
+    fig.supxlabel(f'Matched targets with complete {args.window:g} s arm traces: n = {len(eligible)}',
+                  fontsize=10)
     fig.savefig(output / 'ee_distance_comparison.png', dpi=200)
     plt.close(fig)
     print(json.dumps(aggregates, indent=2)); print(f'Saved: {output}')
