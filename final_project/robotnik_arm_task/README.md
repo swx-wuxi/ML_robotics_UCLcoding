@@ -1,167 +1,122 @@
-1) Make sure the folders "/models", "/configs" from RoboEnv are accessible (easiest is to copy them to this folder)
-2) Use your RoboEnv environent (in whichever way you have been running the labs: pixi, uv, conda, etc)
-3) Run robotnik_arm_task.py
+### 0.Project overview and environment
+This project uses MLP to control a mobile manipulator for an end-effector reaching task. 
 
-Expected behaviour: pybullet 3D environment with 7dof arm mounted on a 4-wheeled platform. The robot moves to reach a target (red dot) with its end-effector. The simulation terminates when the target is reached, and plots of the robot behaviour are shown.
+Policies are trained on expert demonstrations to predict four wheel velocity commands and seven arm joint torques from the measured robot state and target position. Performance is evaluated in Pybullet, with successful reaching requiring an end-effector position error below 1 cm.
 
-Key variables in robotnik_arm_task.py:
+This README explains how to collect data, train and evaluate the models, and locate the generated outputs. 
 
- - TARGET_EE_POS: reach target point in cartesian coordinates (x,y,z), represented by a red dot.
+Run the code using the RoboEnv Python environment provided for the course, which can be activated by 'pixi shell'.
 
- - base_pos:     wheeled base position (x,y,z)
- - base_bearing: wheeled base bearing (angle in radians)
- - q_mes:        arm joint angles (radians)
- - qd_mes:       arm joint angle velocities (rad/s)
+Ensure that the `models/` and `configs/` folders are accessible at the paths used by the scripts. Run all commands below from the repository root. 
 
- - wheel_cmds:     angular velocity command for each wheel (rad/s)
- - torque_arm:     command torques for each arm joint
- - torque_fingers: torque for each finger joint of the end-effector grasper. In this work, they should just remain fixed.
- 
- Assessment Goal:
-  - ML model that produces (wheel_cmds, torque_arm) from measurements (base_pos,base_bearing,q_mes,qd_mes)
-
-## Collecting multiple expert trajectories
-
-Run from the workspace root using the RoboEnv Python environment:
+### 1. How to collect expert data
 
 ```bash
 python final_project/robotnik_arm_task/collect_expert_data.py
 ```
 
-The default run samples 1000 target positions uniformly by area in an annulus
-centred at world `(0, 0)`, with radii 0.9 to 1.5 m and fixed height 0.5 m.
-Edit `NUM_EPISODES`, `TARGET_CENTER_XY`, `TARGET_MIN_RADIUS`,
-`TARGET_MAX_RADIUS`, and `TARGET_HEIGHT` near the top of the collector to change
-the experiment. Set the inner radius to zero to sample a full disk.
-This is an initial sampling region, not a guarantee that every target is reachable.
+The script collects expert demonstrations for 1500 targets sampled uniformly by area
+in an annulus centred at `(0, 0)`, with radii 0.9–1.5 m and height 0.5 m
+(default seed: 42). Each episode uses the original expert controller and the same
+initial robot configuration. Target settings can be changed at the top of the script;
+use `--episodes 5` for a quick trial or `--gui` to display the simulation.
 
-Each episode starts a fresh simulator using the unchanged configuration, so the
-initial base pose, arm configuration, and velocities remain fixed. The expert
-controllers are unchanged: the base aligns first, drives with gentle steering,
-then adjusts its final heading. Continuous simultaneous turning and translation
-is not enforced by the collector.
+Targets are split into 1050 training, 225 validation, and 225 test episodes.
+Failed episodes are saved and marked by `episode_success`; training uses successful
+episodes only. No data augmentation or model training is performed during collection.
 
-Files are created only when the script is run, in a new timestamped folder under
-`robotnik_arm_task/data/`. The folder contains `targets.json` (planned targets and
-splits), individual `episode_XXXX.npz` files, `episodes.json` (results),
-`dataset.npz` (merged samples), and `metadata.json` (collection settings).
-Episodes are saved immediately; final merging uses temporary disk arrays rather
-than retaining all episodes in RAM. Allow space for both individual and merged
-data and temporary uncompressed arrays. Interruptions preserve completed episode
-files, but automatic resume is not implemented.
+Outputs are saved in a new `final_project/robotnik_arm_task/data/expert_*/` folder:
+- `dataset.npz`: merged state–action samples.
+- `episode_XXXX.npz`: individual trajectories.
+- `targets.json`: sampled targets and split assignments.
+- `episodes.json`: episode results.
+- `metadata.json`: collection settings and data description.
 
-With 1000 unique targets, the split is 700 training, 150 validation, and 150 test
-episodes. Failed reaches are retained and marked; this is 1000 attempted
-trajectories, not necessarily 1000 successful trajectories. Training code can
-filter using `episode_success`. Inspect success rates before using the dataset.
+### 2. Model training
 
-For a small trial or explicit targets:
+#### MLP
+Run Stage 1 to train separate Base and Arm MLPs from raw expert trajectories:
 
 ```bash
-python final_project/robotnik_arm_task/collect_expert_data.py --episodes 5
-python final_project/robotnik_arm_task/collect_expert_data.py --target 0 1.1 0.5 --target 1.1 0 0.5
+python final_project/robotnik_arm_task/neural_network_stage1.py
 ```
 
-The seed defaults to 42. `--gui` enables the simulator window; `--output` selects
-a new output folder. Existing output folders are never overwritten.
+The Arm network uses velocity, angle and near-target augmentation. Angle samples
+are generated automatically and cached on the first run. The intermediate model
+is saved as `neural_network_near_target_augmented.npz`.
 
-## Linear baseline
-
-After collection finishes, run:
+After geting this weight, run: 
 
 ```bash
-python final_project/robotnik_arm_task/linear.py
+python final_project/robotnik_arm_task/neural_network.py --bayes
 ```
 
-The script selects the latest timestamped multi-episode folder containing both
-`dataset.npz` and the completion marker `metadata.json`. Set `DATA_PATH` at the
-top of `linear.py` to pin a specific dataset for reproducibility. Incomplete
-collections are skipped. No automatic training is triggered by collection.
+Each trial starts from the intermediate model and updates only the Arm network,
+mixing original, augmented and expert recovery samples. The Base network and
+normalisation parameters remain fixed. Learning rate, L2 regularisation and the
+recovery sampling ratio are selected using nominal and recovery validation errors.BO is applied for hyperparameter tuning. 
 
-Training preserves the collector's train/validation/test assignments and uses
-successful episodes only. Each split must contain successful samples; there is
-no fallback to splitting a single trajectory. Input normalization is fitted on
-training samples only. Incremental QR least squares reduces training workspace
-memory, although the selected dataset arrays are still loaded into RAM.
+If the parameter `--bayes` in the command above is missing, it will not call BO functions and only perform regular fine-tuning.
 
-Outputs in `robotnik_arm_task/` are `linear_model.npz`, `linear_metrics.json`,
-and `linear_predictions.png`; repeated runs overwrite these baseline outputs.
-The figure shows one successful episode from each split. Metrics use all
-successful samples, so longer episodes carry more weight. These are offline
-expert-action prediction results, not closed-loop success rates or evaluations
-over failed expert episodes. No simulator is started.
+Weights are saved as `trained_model_weights/neural_network_bo_recovery_*.npz`,which performs better than the intermediate mode in this simulation.
 
-## Closed-loop final evaluation
+### 3. Model evaluation 
+Set `MODEL_PATH` in `final_evaluation.py` to the model weight (saved in `trained_model_weights` repository)used to evaluate.Also you can change number of targets and test seed. 
 
 ```bash
-python final_project/robotnik_arm_task/evaluation_final.py
+python final_project/robotnik_arm_task/final_evaluation.py 
 ```
 
-This starts PyBullet and loads `linear_model.npz` without retraining. The evaluator
-also reads the collection metadata and episode manifest referenced by the saved
-model, so keep that data folder accessible. A fresh simulator is created for each
-of 100 targets sampled with a new seed from the recorded collection region.
-Targets exactly matching any collected target are excluded. Initial conditions,
-contact settings, and finger control match the official task. Source/config hashes
-must match those recorded at collection time.
+Set `USE_GUI` to `True` if you want to see the Pybullet simulation environment.
 
-Every simulation step uses the measured state to predict four wheel velocities
-and seven arm torques. No expert arm control, gravity compensation, or navigation
-commands are applied. The official base controller runs only as a shadow state
-machine for the original navigation-gated stopping rules; its output commands are
-discarded. This stopping supervisor is separate from the learned policy.
+Outputs are saved in `final_project/robotnik_arm_task/evaluation/final_*/`:
+- `episode_XXXX.npz`: recorded states, actions and end-effector errors for each episode.
+- `results.json`: success rate and per-episode outcomes, durations and final errors.(Most important file)
+- `settings.json`: model path, test targets and evaluation configurations.
 
-The default evaluates a bounded policy: arm torque is clipped to the recorded
-expert limit, and wheel velocity is clipped to a conservative bound derived from
-the recorded expert linear/angular speed limits. Raw and applied commands are
-both recorded. Set `CLIP_COMMANDS = False` to explicitly evaluate the raw policy.
-This is a simulation benchmark, not a hardware deployment script.
+### 4. Arm diagnose
+```bash
+python final_project/robotnik_arm_task/diagnose_arm.py 
+```
+Outputs are saved in `final_project/robotnik_arm_task/diagnostics/arm_plots_*/`:
+- `joint_angle_velocity.png`: expert and MLP joint angles and velocities.
+- `joint_torque.png`: applied joint torques from the two independent rollouts.
+- `ee_path_3d.png`: end-effector paths from a shared start to the same target.
+- `ee_distance.png`: distance to the target over time, with a 1 cm threshold and a 0–15 cm zoom.
 
-Edit `MODEL_PATH`, `NUM_TARGETS`, `TEST_SEED`, `USE_GUI`, and `PLAYBACK_SPEED` at
-the top of the evaluator. GUI playback defaults to approximately real time;
-100 trials can therefore take many minutes. Press `q` in PyBullet to abort the
-batch and preserve results from completed steps. Closing the GUI is not the
-supported abort path.
+Set `DEFAULT_EPISODE` in `diagnose_arm.py` to an evaluation episode.
 
-Outputs are created only on execution in a new timestamped `evaluation/final_*`
-folder: `settings.json`, progressively updated `results.json`, and individual
-`episode_XXXX.npz` files. NPZ fields include pre-action `X`, `raw_actions`,
-applied `actions`, `wheel_cmds`, `torque_arm`, `time`, `ee_pos`, and `ee_error`.
-The GUI displays the target, robot movement, trial number, time, and EE error.
+Set `RUNS` in `distance_evaluation.py` to the evaluation folders to compare.
 
-The reported success rate is an observed closed-loop rate, not a probability
-predicted by the linear regressor. Success requires the official reached message
-and a post-action final EE distance below 0.01 m. `official_success_rate` is also
-reported separately. Stalls and timeouts count as failures; an aborted batch is
-marked incomplete. These fresh targets test generalization within the sampled
-region, not new heights or new initial conditions.
-
-## Recovery fine-tuning (current default)
+### 5. Offline action prediction metrics
 
 ```bash
-RoboEnv/.pixi/envs/default/bin/python final_project/robotnik_arm_task/neural_network.py
+python final_project/robotnik_arm_task/offline_nn_metrics.py
 ```
 
-The default now loads `neural_network_near_target_augmented.npz`, copies a backup,
-and fine-tunes only the arm using a new Adam optimizer at `5e-5`. Base weights and
-all parent normalization arrays stay fixed. The parent NPZ is never overwritten;
-a timestamped `neural_network_recovery_finetuned_*.npz` contains the candidate.
-Use `--init-model PATH` to choose another compatible parent. `--from-scratch`
-retains the earlier workflow and saves `neural_network_near_target_retrained.npz`.
+Set `MODEL_PATH` in the script or pass `--model <path/to/model.npz>`.
+The script evaluates saved weights on the original successful train, validation
+and test samples without retraining. Predictions are inverse-standardised and
+not clipped. Training metrics exclude augmented samples.
 
-Recovery data uses disjoint original train/validation target groups (32/8 episodes
-by default), never evaluation targets. Each fresh simulator replays the recorded
-expert to a near-target state, checks reproduction, physically applies a small
-multi-joint pose disturbance and stationary/toward/away velocity, then runs the
-official expert for 3 seconds. Its saved pre-action reference is retained. Only
-recovery trials with a settled 0.25-second hold within 1 cm contribute labels.
-Full recoveries are cached at 100 Hz, including braking and target holding.
-Training mixes these rows with original samples and existing augmentations.
+Outputs are saved in `final_project/robotnik_arm_task/outputs/offline_metrics_*/`:
+- `metrics.json`: per-output and overall RMSE and R², sample counts and calculation notes.
+- `metrics.csv`: the same scores in tabular form.
+- `base_rmse_r2.png`: wheel-command RMSE and R² across train, validation and test sets.
+- `arm_rmse_r2.png`: joint-torque RMSE and R² across the three sets.
 
-Model selection compares nominal and recovery validation MSE relative to the
-parent, with a 10% nominal-MSE degradation limit. Epoch zero remains a candidate,
-so if no checkpoint improves this offline criterion the output retains the parent
-arm weights. This does not certify better closed-loop success: compare the saved
-candidate against the parent in the evaluator using unchanged task criteria.
-`outputs/recovery_finetune_*/` records provenance, validation history and recovery
-trial summaries. Recovery caches live in `data/augmentation_cache/`.
+### 6. Closed-loop distance comparison
+
+```bash
+python final_project/robotnik_arm_task/distance_evaluation.py
+```
+
+Outputs are saved in `final_project/robotnik_arm_task/outputs/ee_comparison_*/`:
+- `comparison.csv`: success rates, final and minimum distances, distance MSE/RMSE and successful completion times.
+- `episodes.csv`: individual episode metrics for checking failures.
+- `metrics.json`: aggregate results and metric definitions.
+- `ee_distance_comparison.png`: mean distance and mean squared distance during the first 5 s after Arm activation.
+
+The curves use only targets with complete 5 s traces in every compared run;
+the retained count is shown on the figure. Squared distances measure error to
+the target, not deviation from an expert trajectory.

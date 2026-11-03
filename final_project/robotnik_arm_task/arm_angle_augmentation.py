@@ -63,6 +63,8 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
                         if e['episode_id'] in allowed and e['split']==0 and e['success'])
     if not candidates:
         raise ValueError('No successful training episodes available for angle augmentation')
+
+    # 1. Settings:select at most 128 successful trajectories
     rng = np.random.default_rng(seed)
     selected = sorted(rng.choice(candidates, min(episode_limit, len(candidates)), replace=False).tolist())
     source_names = ('robotnik_arm_task.py', 'robotnik_arm_control.py',
@@ -92,9 +94,8 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
         validate_pool(pool, allowed)
         print(f'Angle augmentation cache: {cache} ({len(pool["X"])} rows)', flush=True)
         return pool, info
-
-    # Imports are deferred: ordinary inference and velocity-only training need
-    # neither PyBullet nor Pinocchio.
+    
+    # If there is no cache, read the raw trajectories.
     os.environ.setdefault('MPLCONFIGDIR', '/tmp/robotnik_matplotlib')
     import collect_expert_data as collector
     task = collector.task
@@ -107,7 +108,7 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
     attempted_near_pairs = accepted_near_pairs = 0
     max_state_error = max_torque_error = 0.
 
-    # ******* Deal with randomly selected expert
+    # ******* 2.Deal with randomly selected expert traj ******
     for number, episode_id in enumerate(selected, 1):
         episode_path = dataset.parent/f'episode_{episode_id:04d}.npz'
         # Read the original expert data and check
@@ -133,6 +134,7 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
         row = 0
         found = set()
 
+        # Generate suitable samples
         def probe(*args, **kwargs):
             nonlocal row, max_state_error, max_torque_error, attempted_near_pairs, accepted_near_pairs
             original = official(*args, **kwargs)
@@ -167,57 +169,56 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
                 return np.flatnonzero(~limited | ((q-delta >= np.asarray(lower)+params.limit_margin) &
                                                    (q+delta <= np.asarray(upper)-params.limit_margin)))
 
+            # *****Core of angle augmentation****
             # *****In selected timestamps add velocity and angle offset****
             def emit(offset, multi=False):
                 poses = []
-                # Check both symmetric joint perturbations: q + offset and q - offset.
+                # Check both symmetric joint angle perturbations: q + offset and q - offset.
                 for sign in (1, -1):
-                    qq = q + sign*offset   # posture aug
+                    qq = q + sign*offset   # Add disturbe
                     # Reject the pair if a moved joint crosses its safety margin.
                     if np.any(limited & ((qq < np.asarray(lower)+params.limit_margin) |
                                           (qq > np.asarray(upper)-params.limit_margin))):
                         moved = offset != 0
                         if np.any(moved & limited & ((qq < np.asarray(lower)+params.limit_margin) |
                                                      (qq > np.asarray(upper)-params.limit_margin))):
-                            return False
+                            return False    
                     # Recompute FK to find the EE position at this perturbed pose.
                     perturbed = qp.copy(); perturbed[7:14] = qq
                     task.pin.forwardKinematics(dyn.pin_model, dyn.pin_data, perturbed)
                     task.pin.updateFramePlacements(dyn.pin_model, dyn.pin_data)
                     ee_new = dyn.pin_data.oMf[frame].translation.copy()
                     shift = float(np.linalg.norm(ee_new-ee))
+
                     # For near-target samples, require the configured EE displacement
                     # from the original pose (not the distance to the target).
                     if multi and not near_target['min_shift_m'] <= shift <= near_target['max_shift_m']:
                         return False
                     poses.append((qq, perturbed, ee_new, shift))
 
-                # Both signs passed validation; generate labels for each pose.
                 for qq, perturbed, ee_new, shift in poses:
                     # Ordinary samples keep the original velocity. 
                     # Near-target samples use both original velocity and zero velocity.
-                    
                     modes = ((qd.copy(), 1), (np.zeros(7), 2)) if multi else ((qd.copy(), 0),)
-                    # generate torque labels relevantly
+                    # Generate torque labels relevantly
                     for velocity, kind in modes:
                         # Restore FK for this exact pose before each expert query.
                         task.pin.forwardKinematics(dyn.pin_model, dyn.pin_data, perturbed)
                         task.pin.updateFramePlacements(dyn.pin_model, dyn.pin_data)
-                        
-                        # Copy the pre-action reference so queries do not advance
-                        # the reference used by the replayed expert trajectory.
+
+                        # Recompute the 7 arms' torques using experts
                         torque, _, _ = official(dyn, perturbed, qq.copy(), velocity,
                             reference.copy(), hold.copy(), target.copy(), ee_new.copy(),
                             frame, shoulder, lower, upper, dt, params, reach_active=True)
                         
-                        # Save the perturbed observation and its matching label,
-                        # together with provenance and the sample category.
+                        # Save: Input=disturbed angles + selected velocity + original base  
+                        # Output = recomputed torques
                         xx = x.copy(); xx[4:11] = qq; xx[11:18] = velocity
                         xs.append(xx); ys.append(torque.copy())
                         parents.append(episode_id); parent_rows.append(current)
                         kinds.append(kind); shifts.append(shift)
                 return True
-
+              
             try:
                 if current in single_centers:
                     delta = float(rng.choice(deltas))
@@ -226,7 +227,6 @@ def load_or_build_angle_pool(dataset, training_episodes, deltas=(.002, .005),
                         offset = np.zeros(7); offset[int(rng.choice(joints))] = delta
                         emit(offset)
 
-                # 
                 if current in near_centers:
                     joints = eligible_joints(near_target['max_angle_rad'])
                     if len(joints) >= 2:

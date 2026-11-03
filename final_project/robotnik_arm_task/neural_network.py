@@ -14,10 +14,12 @@ import numpy as np
 from sklearn.neural_network import MLPRegressor
 from sklearn.preprocessing import StandardScaler
 
-
+# Basic concepts: 
+# (1)Each expert trajectory contains 1000 samples per second
+# (2)Two hidden layers, both of them have 128 neurals
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
-BASELINE_MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented01.npz'
+BASELINE_MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented.npz'
 
 # Legacy fitting defaults; fine-tuning reads layer widths from the parent model.
 HIDDEN_LAYERS = (128, 128)
@@ -62,6 +64,7 @@ PHASE_CODES = {"align": 0, "drive": 1, "orient": 2}
 BASE_COLUMNS = [0, 1, 2, 3, 18, 19, 20]
 TREE_KEYS = ("children_left", "children_right", "feature", "threshold", "values")
 
+# Read and load the dataset
 def find_dataset():
     if DATA_PATH is not None:
         return Path(DATA_PATH)
@@ -96,6 +99,7 @@ def load_dataset(path):
             raise ValueError("Non-finite state or action")
     return data
 
+# Split successful episodes only
 def split_indices(data):
     """Keep successful episodes and preserve the collector's target-based split."""
     groups = {}
@@ -128,8 +132,9 @@ def batches(indices):
     for start in range(0, len(indices), DATA_BATCH_SIZE):
         yield indices[start:start + DATA_BATCH_SIZE]
 
+# Exclude arm states so arm deviations cannot 
+# change navigation predictions.
 def base_features(X, phase):
-    """Exclude arm states so arm deviations cannot change navigation predictions."""
     X = np.asarray(X)
     return np.concatenate((X[..., BASE_COLUMNS],
                            np.broadcast_to(np.asarray(phase), X.shape[:-1])[..., None]), axis=-1)
@@ -155,20 +160,26 @@ def validate_nn(model, n_features=None, n_outputs=7):
     if width != n_outputs:
         raise ValueError(f'Expected {n_outputs} NN outputs')
 
+# ********** 
+# Core function: forward pass of MLP, outputs
+# ********** 
 def predict_nn(model, X):
     X = np.asarray(X, dtype=np.float32)
     inputs = len(model['nn_x_mean'])
     if X.ndim not in (1, 2) or X.shape[-1] != inputs or not np.isfinite(X).all():
         raise ValueError(f'Expected finite input ({inputs},) or (N, {inputs})')
     h = (X - model['nn_x_mean']) / model['nn_x_scale']
-    # CORE CHANGE: two Linear+ReLU hidden layers, linear regression output.
+
+    # MLP structure: two Linear+ReLU hidden layers
     for i in range(3):
         h = h @ model[f'nn_w{i}'] + model[f'nn_b{i}']
         if i < 2:
             h = np.maximum(h, 0)
+
+    # Return the real output torque
     return h * model['nn_y_scale'] + model['nn_y_mean']
 
-
+# Model outputs
 def export_nn(estimator, xs, ys):
     model = dict(nn_x_mean=xs.mean_.astype(np.float32),
                  nn_x_scale=xs.scale_.astype(np.float32),
@@ -203,34 +214,34 @@ def velocity_augmentation_settings(path):
                 scaler_policy='Fit on original training rows only',
                 validation_test_policy='Original rows only; no augmentation')
 
-
+# *********Improvement stage1: *************
+# Add only one joint's velocity for each sample
+# Generate two new training samples while keeping the original sample. 
 def augment_arm_velocity(X, y, rng, settings):
-    """Exact velocity-only expert labels without requiring FK or a simulator.
-
-    In the official expert, IK and q_ref integration do not depend on measured
-    qd. At fixed pose/reference, delta_tau = -kd*delta_qd before clipping.
-    A clipped source torque hides its pre-clip value, so NEVER perturb that
-    joint. Other joints may remain clipped because their inputs do not change.
-    """
+    # Find one eligible joint
     X, y = np.asarray(X), np.asarray(y)
     if X.ndim != 2 or X.shape[1] != 21 or y.shape != (len(X), 7):
         raise ValueError('Velocity augmentation expects X=(N,21), y=(N,7)')
     limit = settings['max_torque']
     eligible = np.abs(y) < limit - 1e-5
-    rows = np.flatnonzero(eligible.any(axis=1))
+    rows = np.flatnonzero(eligible.any(axis=1)) # index of eligible samples
     if not len(rows):
         return X.copy(), y.copy()
-    # Uniformly choose one eligible joint for each row; both signs use the same
-    # magnitude. No dense (dataset x 14) augmented array is ever allocated.
+    
+    # Randomly select one eligible joint for velocity augmentation
     scores = rng.random((len(rows), 7))
     scores[~eligible[rows]] = -1
     joints = scores.argmax(axis=1)
     delta = rng.choice(settings['deltas'], size=len(rows))
     local = np.arange(len(rows))
-    parts_x, parts_y = [X], [y]
+    parts_x, parts_y = [X], [y] # keep the original sample
+
+    # Generate two new samples for each original sample, 
+    # with an offset of increased and decreased joint speed
+    # Output torque also needs changes. 
     for sign in (1, -1):
         xx, yy = X[rows].copy(), y[rows].copy()
-        xx[local, 11 + joints] += sign * delta
+        xx[local, 11 + joints] += sign * delta 
         yy[local, joints] = np.clip(
             yy[local, joints] - settings['kd'] * sign * delta, -limit, limit)
         parts_x.append(xx)
@@ -239,7 +250,8 @@ def augment_arm_velocity(X, y, rng, settings):
     order = rng.permutation(len(xx))
     return xx[order], yy[order]
 
-
+# Angle augmentation
+# Prepare the angle pool only
 def prepare_angle_pool(path, data, groups):
     if not ARM_ANGLE_AUGMENTATION:
         return None, None
@@ -248,6 +260,8 @@ def prepare_angle_pool(path, data, groups):
     if ARM_NEAR_TARGET_AUGMENTATION and (not np.isfinite(ARM_NEAR_TARGET_ROWS_PER_ORIGINAL)
                                         or ARM_NEAR_TARGET_ROWS_PER_ORIGINAL <= 0):
         raise ValueError('Near-target sample ratio must be finite and positive')
+
+    # Call the angle generation function
     from arm_angle_augmentation import load_or_build_angle_pool
     pool, info = load_or_build_angle_pool(
         path, np.unique(data['episode_id'][groups['train']]),
@@ -260,7 +274,6 @@ def prepare_angle_pool(path, data, groups):
     print(f"Angle pool sample counts: {info.get('sample_counts')}; "
           f"accepted near-target pairs: {info.get('accepted_near_pairs', 0)}", flush=True)
     return pool, info
-
 
 def mix_angle_samples(X, y, original_count, pool, rng):
     if pool is None:
@@ -285,7 +298,7 @@ def mix_angle_samples(X, y, original_count, pool, rng):
     yy = np.concatenate((y, pool['y'][idx]))
     order = rng.permutation(len(xx))
     return xx[order], yy[order], count
-
+# *********Improvement stage1 Ends*************
 
 def fit_nn(X, y, groups, augmentation=None, angle_pool=None):
     # CORE CHANGE: fit normalization on TRAIN ONLY, never on validation/test.
@@ -524,7 +537,8 @@ def frozen_x(model, X):
 def frozen_y(model, y):
     return (np.asarray(y,dtype=np.float32)-model['nn_y_mean'])/model['nn_y_scale']
 
-
+### Stage2(final) improvement ###
+# Used pre-trained model from stage1
 def finetune_arm(model, X, y, train_ids, validation_ids, recovery_train,
                  recovery_validation, augmentation=None, angle_pool=None, on_best=None):
     net = initialize_finetune_arm(model)
@@ -550,24 +564,31 @@ def finetune_arm(model, X, y, train_ids, validation_ids, recovery_train,
                     recovery_validation_mse=recovery_baseline, score=1., selected=True)]
     rng = np.random.default_rng(RANDOM_STATE+20)
     for epoch in range(FINETUNE_EPOCHS):
+        # a. From raw samples
         order = rng.choice(train_ids, min(FINETUNE_ORIGINAL_ROWS_PER_EPOCH,len(train_ids)),replace=False)
         rows = recovery_rows = 0
         for start in range(0,len(order),BATCH_SIZE):
             idx = order[start:start+BATCH_SIZE]
             xb,yb = X[idx],y[idx]
+            # b. from angle/velocity aug pool
             if augmentation is not None:
                 xb,yb = augment_arm_velocity(xb,yb,rng,augmentation)
             xb,yb,_ = mix_angle_samples(xb,yb,len(idx),angle_pool,rng)
+
+            # c. from recovery pool
             count = max(1,int(round(len(idx)*FINETUNE_RECOVERY_ROWS_PER_ORIGINAL)))
             ri = rng.integers(len(recovery_train['X']),size=count)
             xb = np.concatenate((xb,recovery_train['X'][ri]))
             yb = np.concatenate((yb,recovery_train['y'][ri]))
             perm = rng.permutation(len(xb));xb,yb=xb[perm],yb[perm]
+
             for offset in range(0,len(xb),BATCH_SIZE):
                 xx,yy=xb[offset:offset+BATCH_SIZE],yb[offset:offset+BATCH_SIZE]
                 net.batch_size=len(xx)
                 net.partial_fit(frozen_x(model,xx),frozen_y(model,yy))
             rows+=len(xb);recovery_rows+=count
+
+        # Evaluation metrics for finetuning
         nominal=loss(X,y,validation_ids)
         recovery=loss(recovery_validation['X'],recovery_validation['y'])
         score=.5*nominal/max(nominal_baseline,1e-12)+.5*recovery/max(recovery_baseline,1e-12)
@@ -637,7 +658,9 @@ def finetune_main(init_model=None):
     arm_groups={name:idx[active[idx]] for name,idx in groups.items()}
     if any(not len(idx) for idx in arm_groups.values()):
         raise ValueError('Empty arm split')
+    
     from arm_recovery_data import load_or_build_recovery_pool,DEFAULT_SETTINGS
+    # Prepare two sets of recovery data
     recovery_train,train_info=load_or_build_recovery_pool(path,
         np.unique(data['episode_id'][groups['train']]),0)
     validation_settings=dict(DEFAULT_SETTINGS,episodes=8)
