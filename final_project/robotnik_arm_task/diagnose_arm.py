@@ -47,7 +47,7 @@ with quiet_native(stderr=True):
 
 ROOT = Path(__file__).resolve().parent
 ARM_WINDOW_S = 5.0
-DEFAULT_EPISODE = ROOT/'evaluation/final_20261031T230639_874949Z/episode_0002.npz'
+DEFAULT_EPISODE = ROOT/'evaluation/final_20261029T194112_590396Z/episode_0088.npz'
 
 def predict(model, X):
     h = (np.asarray(X, dtype=np.float32)-model['nn_x_mean'])/model['nn_x_scale']

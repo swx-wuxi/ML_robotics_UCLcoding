@@ -74,6 +74,38 @@ Outputs are saved in `final_project/robotnik_arm_task/evaluation/final_*/`:
 - `results.json`: success rate and per-episode outcomes, durations and final errors.(Most important file)
 - `settings.json`: model path, test targets and evaluation configurations.
 
+#### Generalisation and robustness tests
+
+```bash
+python final_project/robotnik_arm_task/performance_evaluation.py
+```
+
+Edit the switches at the top of `performance_evaluation.py` (Python uses `True`, not `TRUE`):
+- `TEST_GENERALIZATION = True`: sample targets uniformly by area within radii
+  0.6–1.8 m around the collection centre. Independently sample height offsets
+  uniformly from -0.1 to +0.1 m relative to the collection height, giving
+  z=0.4–0.6 m for the original dataset. The XY range includes part of the
+  original collection annulus; targets are not restricted to outside it.
+- `TEST_ROBUSTNESS = True`: run the same in-region targets twice, first without
+  perturbations and then with end-effector force pulses and joint observation noise.
+  Default pulses start 0.25, 1.0 and 2.0 s **after arm activation**, each lasting
+  0.10 s, with world-frame forces `(4,0,0)`, `(0,-4,0)`, `(0,0,3)` N. During pulses,
+  Gaussian noise has standard deviations 0.01 rad and 0.05 rad/s for joint angles
+  and velocities. Set force vectors or noise scales to zero to isolate either effect.
+
+Both switches enabled run separate tests; both disabled run nothing. This script
+has its own `MODEL_PATH`, `NUM_TARGETS`, `TEST_SEED`, `USE_GUI` and `PLAYBACK_SPEED`.
+Its default model is `neural_network_bo_recovery_20261028T190338_972438Z.npz`.
+The original `final_evaluation.py` entry point retains its existing behaviour.
+
+The evaluator prints only running success rates for `generalization`,
+`robustness_baseline` and `robustness`. It saves only these success rates (fractions
+from 0 to 1) in `evaluation/performance_*/summary.json`; trajectories, settings,
+errors and recovery metrics are not saved. Simulator library messages may still
+appear. Success retains the original final-state tolerance and stop rules, using
+true simulator state. Early success/failure can skip later pulses. Manually
+aborted episodes are excluded; `null` means no completed episodes in that suite.
+
 ### 4. Arm diagnose
 ```bash
 python final_project/robotnik_arm_task/diagnose_arm.py 
@@ -120,3 +152,6 @@ Outputs are saved in `final_project/robotnik_arm_task/outputs/ee_comparison_*/`:
 The curves use only targets with complete 5 s traces in every compared run;
 the retained count is shown on the figure. Squared distances measure error to
 the target, not deviation from an expert trajectory.
+
+
+### 7. Add terminal feedback correction

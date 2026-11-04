@@ -21,16 +21,16 @@ ROOT = Path(__file__).resolve().parent
 # Change different models here for comparison
 # ************************************************
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_model.npz"
-MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
+# MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
-# MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_recovery_finetuned_20261028T183135_797512Z.npz"
+MODEL_PATH = ROOT / "trained_model_weights"/"model.npz"
 
 # ************************************************
 # Change different models here for comparison
 # ************************************************
 NUM_TARGETS = 100
 TEST_SEED = 42 #  1 20261024
-USE_GUI = True
+USE_GUI = False
 PLAYBACK_SPEED = 1.0
 # Keep bounded commands, and save raw predictions separately for reproducibility.
 CLIP_COMMANDS = True
@@ -256,7 +256,7 @@ def sample_test_targets(metadata, dataset_path):
     return np.asarray(targets)
 
 
-def run_episode(model, target, metadata, episode_id):
+def run_episode(model, target, metadata, episode_id, perturbation=None, verbose=True):
     """Evaluate learned actions; staged policies also use expert posture holding."""
     sim = None
     rows = []
@@ -268,6 +268,8 @@ def run_episode(model, target, metadata, episode_id):
         sim.SetFloorFriction(1.0)
         client = sim.pybullet_client
         rid = sim.bot[0].bot_pybullet
+        if perturbation is not None:
+            perturbation.bind(client, rid)
         for j in range(client.getNumJoints(rid)):
             if "wheel" in client.getJointInfo(rid, j)[1].decode():
                 client.changeDynamics(rid, j, contactStiffness=30000,
@@ -381,7 +383,9 @@ def run_episode(model, target, metadata, episode_id):
                     # CORE CHANGE: wheels remain stopped throughout arm reaching.
                     # CORE CHANGE: append pre-action state once per arm step. The first
                     # reaching state pads missing history, exactly as during training.
-                    arm_input = arm_history.append(X)
+                    policy_X = (perturbation.observe(X, step * dt, arm_start_time, dt)
+                                if perturbation is not None else X)
+                    arm_input = arm_history.append(policy_X)
                     arm_action = (predict_nn(model, arm_input) if neural_arm else predict_tree(
                         arm_tree, arm_input, n_features=len(arm_input)))
                     raw = np.concatenate((np.zeros(4), arm_action))
@@ -397,8 +401,11 @@ def run_episode(model, target, metadata, episode_id):
                     raw = np.concatenate((wheels, hold_torque))
                 previous_pose = X[:4].copy()
             else:
-                raw = (predict_tree(model, X) if model["model_type"] == "decision_tree" else
-                       ((X - model["mean"]) / model["scale"]) @ model["weights"] + model["bias"])
+                # Legacy policies control the arm from the first simulation step.
+                policy_X = (perturbation.observe(X, step * dt, 0.0, dt)
+                            if perturbation is not None else X)
+                raw = (predict_tree(model, policy_X) if model["model_type"] == "decision_tree" else
+                       ((policy_X - model["mean"]) / model["scale"]) @ model["weights"] + model["bias"])
             if not np.isfinite(raw).all():
                 reason = "non_finite_prediction"
                 break
@@ -416,7 +423,11 @@ def run_episode(model, target, metadata, episode_id):
                                    expert_qd_ref.copy()))
             cmd.SetControlCmd(np.concatenate((action, np.zeros(6))),
                               ["velocity"] * 4 + ["torque"] * 13)
+            if perturbation is not None:
+                perturbation.before_step()
             sim.Step(cmd, "torque")
+            if perturbation is not None:
+                perturbation.record(X)
             phase_log.append("arm" if staged and arm_active else (phase if staged else "legacy"))
             rows.append((X.copy(), raw.copy(), action.copy(), step * dt, ee.copy(), error))
             if USE_GUI:
@@ -468,11 +479,16 @@ def run_episode(model, target, metadata, episode_id):
             data["torque_arm"] = data["actions"][:, 4:]
             summary["clipped_command_fraction"] = float(np.mean(
                 data["actions"] != data["raw_actions"]))
-            print("Last wheel commands (rad/s):", data["wheel_cmds"][-1])
-            print("Last arm torques (N*m):", data["torque_arm"][-1])
+            if verbose:
+                print("Last wheel commands (rad/s):", data["wheel_cmds"][-1])
+                print("Last arm torques (N*m):", data["torque_arm"][-1])
         else:
             data = {}
             summary["clipped_command_fraction"] = None
+        if perturbation is not None:
+            extra_data, extra_summary = perturbation.finish(data, summary, dt)
+            data.update(extra_data)
+            summary["robustness"] = extra_summary
         return data, summary
     finally:
         if sim is not None:
