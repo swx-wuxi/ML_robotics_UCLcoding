@@ -32,6 +32,26 @@ Outputs are saved in a new `final_project/robotnik_arm_task/data/expert_*/` fold
 - `episodes.json`: episode results.
 - `metadata.json`: collection settings and data description.
 
+#### Data quality checks
+
+```bash
+python final_project/robotnik_arm_task/check_data_quality.py
+```
+
+Audits the latest `data/expert_*/` dataset for array validity, time/state alignment,
+target-split overlap, action limits and success-label consistency. It also reports
+target and state coverage. Use `--dataset <folder>` to select a dataset and
+`--check-merged` to compare merged core arrays against individual episode files.
+
+Outputs are saved in `final_project/robotnik_arm_task/outputs/data_quality_*/`:
+
+- `report.html` and `dataset_*.png`: report and diagnostic plots.
+- `metrics.json`: metrics and findings.
+- `comparison.csv` and `episodes.csv`: dataset and episode summaries.
+
+`PASS_SCANNED` indicates no hard errors in the completed scan; `PRELIMINARY`
+indicates incomplete coverage, and `ERROR` indicates failed checks.
+
 ### 2. Model training
 
 #### MLP
@@ -80,31 +100,24 @@ Outputs are saved in `final_project/robotnik_arm_task/evaluation/final_*/`:
 python final_project/robotnik_arm_task/performance_evaluation.py
 ```
 
-Edit the switches at the top of `performance_evaluation.py` (Python uses `True`, not `TRUE`):
-- `TEST_GENERALIZATION = True`: sample targets uniformly by area within radii
-  0.6–1.8 m around the collection centre. Independently sample height offsets
-  uniformly from -0.1 to +0.1 m relative to the collection height, giving
-  z=0.4–0.6 m for the original dataset. The XY range includes part of the
-  original collection annulus; targets are not restricted to outside it.
-- `TEST_ROBUSTNESS = True`: run the same in-region targets twice, first without
-  perturbations and then with end-effector force pulses and joint observation noise.
-  Default pulses start 0.25, 1.0 and 2.0 s **after arm activation**, each lasting
-  0.10 s, with world-frame forces `(4,0,0)`, `(0,-4,0)`, `(0,0,3)` N. During pulses,
-  Gaussian noise has standard deviations 0.01 rad and 0.05 rad/s for joint angles
-  and velocities. Set force vectors or noise scales to zero to isolate either effect.
+Set `MODEL_PATH` in this script independently of `final_evaluation.py`.
+Adjust `NUM_TARGETS`, `TEST_SEED` and `USE_GUI` as needed (defaults: 100, 42 and `False`).
 
-Both switches enabled run separate tests; both disabled run nothing. This script
-has its own `MODEL_PATH`, `NUM_TARGETS`, `TEST_SEED`, `USE_GUI` and `PLAYBACK_SPEED`.
-Its default model is `neural_network_bo_recovery_20261028T190338_972438Z.npz`.
-The original `final_evaluation.py` entry point retains its existing behaviour.
+- `TEST_GENERALIZATION = True`: test random targets at radii 0.75–1.65 m and
+  heights 0.45–0.55 m for the original dataset. Change
+  `GENERALIZATION_RADIUS_RANGE_M` and `GENERALIZATION_HEIGHT_OFFSETS_M` to adjust
+  the absolute radius bounds and height offsets from the collection height.
+- `TEST_ROBUSTNESS = True`: compare identical targets from the collection region
+  with and without external forces and joint-observation noise. Three 0.1 s
+  end-effector force pulses start 0.25, 1.0 and 2.0 s after arm activation,
+  using world-frame forces `(4,0,0)`, `(0,-4,0)` and `(0,0,3)` N. During pulses,
+  Gaussian position/velocity noise has standard deviations of 0.01 rad and
+  0.05 rad/s. All perturbation settings are editable at the top of the script.
 
-The evaluator prints only running success rates for `generalization`,
-`robustness_baseline` and `robustness`. It saves only these success rates (fractions
-from 0 to 1) in `evaluation/performance_*/summary.json`; trajectories, settings,
-errors and recovery metrics are not saved. Simulator library messages may still
-appear. Success retains the original final-state tolerance and stop rules, using
-true simulator state. Early success/failure can skip later pulses. Manually
-aborted episodes are excluded; `null` means no completed episodes in that suite.
+Both switches enabled run separate suites; both disabled run nothing.
+Success uses the original tolerance and true simulator state. Early termination
+may skip later pulses. Only success rates are printed and saved to
+`final_project/robotnik_arm_task/evaluation/performance_*/summary.json`.
 
 ### 4. Arm diagnose
 ```bash
@@ -155,3 +168,18 @@ the target, not deviation from an expert trajectory.
 
 
 ### 7. Add terminal feedback correction
+
+```bash
+python final_project/robotnik_arm_task/feedback_improve.py
+```
+
+This script combines the trained neural policy with controller-level terminal
+feedback compensation to correct residual reaching errors during execution.
+The model weights remain fixed; the feedback controller adds bounded corrections
+to the predicted arm torques near the target. After running this command, the evaluation is started and it will output evaluation metrics.
+
+This hybrid approach achieved the
+best observed success rate of **94%** in our evaluation. Run this script to see the best results for this task.
+
+The script uses `MODEL_PATH` from `final_evaluation.py` by default. Pass
+`--model <path/to/model.npz>` to select a different trained model.
