@@ -21,9 +21,9 @@ ROOT = Path(__file__).resolve().parent
 # Change different models here for comparison
 # ************************************************
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_model.npz"
-# MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
+MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
-MODEL_PATH = ROOT / "trained_model_weights"/"model.npz"
+# MODEL_PATH = ROOT / "trained_model_weights"/"model.npz"
 
 # ************************************************
 # Change different models here for comparison
