@@ -23,7 +23,6 @@ ROOT = Path(__file__).resolve().parent
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_model.npz"
 MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
-# MODEL_PATH = ROOT / "trained_model_weights"/"model.npz"
 
 # ************************************************
 # Change different models here for comparison
@@ -256,8 +255,14 @@ def sample_test_targets(metadata, dataset_path):
     return np.asarray(targets)
 
 
-def run_episode(model, target, metadata, episode_id, perturbation=None, verbose=True):
+def run_episode(model, target, metadata, episode_id, perturbation=None, verbose=True,
+                arm_feedback=None):
     """Evaluate learned actions; staged policies also use expert posture holding."""
+    if arm_feedback is not None:
+        if model["model_type"] != "staged_neural_network":
+            raise ValueError("Terminal feedback requires a staged neural-network policy")
+        if not CLIP_COMMANDS:
+            raise ValueError("Terminal feedback requires CLIP_COMMANDS=True")
     sim = None
     rows = []
     reason = "manual_exit"
@@ -388,6 +393,12 @@ def run_episode(model, target, metadata, episode_id, perturbation=None, verbose=
                     arm_input = arm_history.append(policy_X)
                     arm_action = (predict_nn(model, arm_input) if neural_arm else predict_tree(
                         arm_tree, arm_input, n_features=len(arm_input)))
+                    if arm_feedback is not None:
+                        arm_action = np.asarray(arm_feedback.correct(
+                            arm_action, dynamics, measured_q_pin, X, ee.copy(), frame,
+                            arm_lower, arm_upper, dt), dtype=float)
+                        if arm_action.shape != (7,):
+                            raise ValueError("Terminal feedback must return seven arm torques")
                     raw = np.concatenate((np.zeros(4), arm_action))
                 else:
                     nav_input = base_features(X, PHASE_CODES[phase])
@@ -485,6 +496,8 @@ def run_episode(model, target, metadata, episode_id, perturbation=None, verbose=
         else:
             data = {}
             summary["clipped_command_fraction"] = None
+        if arm_feedback is not None:
+            arm_feedback.annotate(data, summary)
         if perturbation is not None:
             extra_data, extra_summary = perturbation.finish(data, summary, dt)
             data.update(extra_data)
@@ -495,12 +508,18 @@ def run_episode(model, target, metadata, episode_id, perturbation=None, verbose=
             sim.pybullet_client.disconnect()
 
 
-def main():
+def main(*, arm_feedback_factory=None, arm_feedback_settings=None):
     if NUM_TARGETS <= 0 or PLAYBACK_SPEED <= 0:
         raise ValueError("NUM_TARGETS and PLAYBACK_SPEED must be positive")
     model, dataset_path, metadata = load_model()
+    if arm_feedback_factory is not None:
+        if model["model_type"] != "staged_neural_network":
+            raise ValueError("Terminal feedback requires a staged neural-network policy")
+        if not CLIP_COMMANDS:
+            raise ValueError("Terminal feedback requires CLIP_COMMANDS=True")
     targets = sample_test_targets(metadata, dataset_path)
-    out = ROOT / "evaluation" / datetime.now(timezone.utc).strftime("final_%Y%m%dT%H%M%S_%fZ")
+    prefix = "feedback_" if arm_feedback_factory is not None else "final_"
+    out = ROOT / "evaluation" / datetime.now(timezone.utc).strftime(prefix + "%Y%m%dT%H%M%S_%fZ")
     out.mkdir(parents=True, exist_ok=False)
     settings = dict(source_config_changes=model.get("source_config_changes", []), model=str(MODEL_PATH), model_sha256=hashlib.sha256(MODEL_PATH.read_bytes()).hexdigest(),
                     dataset=str(dataset_path), seed=TEST_SEED, targets=targets.tolist(),
@@ -515,11 +534,18 @@ def main():
                     base_stop_angular_speed=BASE_STOP_ANGULAR_SPEED,
                     stop_policy="Staged models: geometric arrival and settling gate; navigation timeout fails. "
                                 "Legacy models: shadow navigation. Official task success tolerance retained.")
+    if arm_feedback_factory is not None:
+        settings["arm_feedback"] = arm_feedback_settings
     (out / "settings.json").write_text(json.dumps(settings, indent=2) + "\n")
     results = []
     for i, target in enumerate(targets):
         print(f"\nEvaluating {i + 1}/{NUM_TARGETS}: {target}", flush=True)
-        data, result = run_episode(model, target, metadata, i)
+        if arm_feedback_factory is None:
+            data, result = run_episode(model, target, metadata, i)
+        else:
+            # A fresh controller prevents integral state leaking between episodes.
+            feedback = arm_feedback_factory(metadata)
+            data, result = run_episode(model, target, metadata, i, arm_feedback=feedback)
         np.savez_compressed(out / f"episode_{i:04d}.npz", **data,
                             target=target, feature_names=np.asarray(FEATURE_NAMES),
                             action_names=np.asarray(ACTION_NAMES))

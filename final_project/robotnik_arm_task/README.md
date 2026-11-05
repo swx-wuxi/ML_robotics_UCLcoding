@@ -1,13 +1,33 @@
 ### 0.Project overview and environment
-This project uses MLP to control a mobile manipulator for an end-effector reaching task. 
 
-Policies are trained on expert demonstrations to predict four wheel velocity commands and seven arm joint torques from the measured robot state and target position. Performance is evaluated in Pybullet, with successful reaching requiring an end-effector position error below 1 cm.
+This project trains separate base and arm MLPs by behaviour cloning for
+mobile-manipulator reaching. The policies predict four wheel velocities and
+seven joint torques from robot observations and the target position. Evaluation
+uses PyBullet with a 1 cm end-effector position tolerance.
 
-This README explains how to collect data, train and evaluate the models, and locate the generated outputs. 
+Activate the course-provided RoboEnv environment from the workspace root:
 
-Run the code using the RoboEnv Python environment provided for the course, which can be activated by 'pixi shell'.
+```bash
+cd RoboEnv
+pixi shell
+cd ..
+```
 
-Ensure that the `models/` and `configs/` folders are accessible at the paths used by the scripts. Run all commands below from the repository root. 
+Run subsequent commands from the workspace root containing `RoboEnv/` and
+`final_project/`. Keep `models/` and `configs/` under
+`final_project/robotnik_arm_task/`.
+
+#### Code sources and modifications
+
+`robotnik_arm_task.py` and `robotnik_arm_control.py` are adapted from the
+[COMP0245 course template](https://github.com/VModugno/LAB_SESSION_COMP_0245_2026_PUBLIC/tree/main/final/robotnik_arm_task),
+which provides simulation setup and expert controllers using PyBullet,
+Pinocchio and `simulation_and_control`. Robot models and configuration files
+are supplied course assets.
+
+We wrote the data collection, quality checks, augmentation, training, evaluation,
+plotting and terminal feedback scripts. MLP training uses scikit-learn;
+Bayesian optimisation uses scikit-optimize.
 
 ### 1. How to collect expert data
 
@@ -82,6 +102,11 @@ Weights are saved as `trained_model_weights/neural_network_bo_recovery_*.npz`,wh
 
 ### 3. Model evaluation 
 Set `MODEL_PATH` in `final_evaluation.py` to the model weight (saved in `trained_model_weights` repository)used to evaluate.Also you can change number of targets and test seed. 
+
+Evaluation requires the collection's `metadata.json` and `episodes.json`, but not
+`dataset.npz` or individual training trajectories; when using downloaded weights,
+update `dataset_path` in `load_model()` to a local path whose parent contains
+these JSON files, as the saved weights embed the original absolute path.
 
 ```bash
 python final_project/robotnik_arm_task/final_evaluation.py 
@@ -183,3 +208,9 @@ best observed success rate of **94%** in our evaluation. Run this script to see 
 
 The script uses `MODEL_PATH` from `final_evaluation.py` by default. Pass
 `--model <path/to/model.npz>` to select a different trained model.
+
+Outputs are saved in `final_project/robotnik_arm_task/evaluation/feedback_*/`:
+
+- `episode_XXXX.npz`: states, actions, nominal arm torques and feedback corrections.
+- `results.json`: success rate and per-episode outcomes.
+- `settings.json`: model, targets, evaluation settings and feedback parameters.

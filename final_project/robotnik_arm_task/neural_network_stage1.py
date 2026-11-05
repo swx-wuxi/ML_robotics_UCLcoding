@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = None
-MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented01.npz'
+MODEL_PATH = ROOT / 'trained_model_weights' / 'neural_network_near_target_augmented.npz'
 HIDDEN_LAYERS = (128, 128)
 BATCH_SIZE = 4096
 MAX_EPOCHS = 100

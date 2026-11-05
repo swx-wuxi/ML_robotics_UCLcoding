@@ -1,6 +1,6 @@
 """Explicit hybrid evaluation: frozen neural policy + bounded terminal feedback.
 
-Run manually in baseline_mode. This does not train or collect training data.
+Run: python feedback_improve.py [--model path/to/model.npz]. No training is done.
 The existing evaluator supplies the same state, dynamics, region and stop rules.
 """
 import argparse
