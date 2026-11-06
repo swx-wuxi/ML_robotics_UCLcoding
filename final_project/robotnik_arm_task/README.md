@@ -101,16 +101,18 @@ If the parameter `--bayes` in the command above is missing, it will not call BO 
 Weights are saved as `trained_model_weights/neural_network_bo_recovery_*.npz`,which performs better than the intermediate mode in this simulation.
 
 ### 3. Model evaluation 
-Set `MODEL_PATH` in `final_evaluation.py` to the model weight (saved in `trained_model_weights` repository)used to evaluate.Also you can change number of targets and test seed. 
-
-Evaluation requires the collection's `metadata.json` and `episodes.json`, but not
-`dataset.npz` or individual training trajectories; when using downloaded weights,
-update `dataset_path` in `load_model()` to a local path whose parent contains
-these JSON files, as the saved weights embed the original absolute path.
+After environment setup, run the pretrained model directly; no data collection
+or training is needed. `data/expert_*/` already contains the required
+`metadata.json` and `episodes.json`, which are located automatically.
+Full training trajectories are not included or required for this evaluation.
 
 ```bash
-python final_project/robotnik_arm_task/final_evaluation.py 
+python final_project/robotnik_arm_task/final_evaluation.py
 ```
+
+Optionally change `MODEL_PATH`, `NUM_TARGETS` or `TEST_SEED` in the script.
+`DATASET_DIR = None` selects the latest local `data/expert_*/` folder; set a
+script-relative path such as `Path("data/expert_20261024T132118_440711Z")` to choose one.
 
 Set `USE_GUI` to `True` if you want to see the Pybullet simulation environment.
 

@@ -24,6 +24,11 @@ ROOT = Path(__file__).resolve().parent
 MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_bo_recovery_20261028T190338_972438Z.npz"
 # MODEL_PATH = ROOT / "trained_model_weights"/"neural_network_near_target_augmented.npz"
 
+# None selects the latest data/expert_* folder containing both evaluation JSONs.
+# To select a collection, set e.g. Path("data/expert_20261024T132118_440711Z").
+# Relative paths are resolved from this script's directory, regardless of cwd.
+DATASET_DIR = None
+
 # ************************************************
 # Change different models here for comparison
 # ************************************************
@@ -171,7 +176,28 @@ def predict_nn(model, X):
     return h * model['nn_y_scale'] + model['nn_y_mean']
 
 
+def find_evaluation_dataset():
+    """Locate local collection JSONs without using paths embedded in weights."""
+    required = ("metadata.json", "episodes.json")
+    if DATASET_DIR is not None:
+        folder = ROOT / Path(DATASET_DIR)
+        missing = [name for name in required if not (folder / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"Missing evaluation files in {folder}: {', '.join(missing)}")
+        return folder / "dataset.npz"
+    for folder in sorted((ROOT / "data").glob("expert_*"), reverse=True):
+        if all((folder / name).is_file() for name in required):
+            # Keep the existing return interface; dataset.npz itself is not read.
+            return folder / "dataset.npz"
+    raise FileNotFoundError(
+        f"No evaluation collection found under {ROOT / 'data' / 'expert_*'}. "
+        "Run collect_expert_data.py to generate metadata.json and episodes.json, "
+        "or set DATASET_DIR to a collection folder relative to this script."
+    )
+
+
 def load_model():
+    dataset_path = find_evaluation_dataset()
     with np.load(MODEL_PATH, allow_pickle=False) as archive:
         model_type = str(archive["model_type"].item()) if "model_type" in archive else "linear"
         if model_type == "staged_neural_network":
@@ -203,7 +229,6 @@ def load_model():
             raise ValueError("Model feature order is incompatible")
         if archive["action_names"].tolist() != ACTION_NAMES:
             raise ValueError("Model action order is incompatible")
-        dataset_path = Path(str(archive["dataset_path"].item()))
     if model_type == "staged_neural_network":
         if "base_nn_x_mean" in model:
             validate_nn(base_network(model), n_features=8, n_outputs=4)
@@ -222,7 +247,7 @@ def load_model():
                 raise ValueError(f"Invalid model parameter: {key}")
         if np.any(model["scale"] <= 0):
             raise ValueError("Model scale must be positive")
-    # Use the exact collection settings associated with the trained model.
+    # Use settings from the selected local collection.
     metadata = json.loads((dataset_path.parent / "metadata.json").read_text())
     # Whole-file hashes also change for comments; log mismatches without blocking.
     changed = []
