@@ -101,10 +101,11 @@ If the parameter `--bayes` in the command above is missing, it will not call BO 
 Weights are saved as `trained_model_weights/neural_network_bo_recovery_*.npz`,which performs better than the intermediate mode in this simulation.
 
 ### 3. Model evaluation 
-After environment setup, run the pretrained model directly; no data collection
-or training is needed. `data/expert_*/` already contains the required
-`metadata.json` and `episodes.json`, which are located automatically.
-Full training trajectories are not included or required for this evaluation.
+First run: create `data/` under `final_project/robotnik_arm_task/`, then copy
+`Default_data_for_evaluation/expert_20261024T132118_440711Z/` into it, keeping
+the folder and its four JSON files together (`data/expert_20261024T132118_440711Z/*.json`).
+After environment setup, run the pretrained evaluation below; no data collection
+or training is needed. Full training trajectories are not included or required.
 
 ```bash
 python final_project/robotnik_arm_task/final_evaluation.py

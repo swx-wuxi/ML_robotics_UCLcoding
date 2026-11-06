@@ -1,0 +1,220 @@
+{
+  "dataset": "/home/swx/ML_robots_coding/final_project/robotnik_arm_task/data/expert_20261024T132118_440711Z",
+  "errors": [],
+  "warnings": [],
+  "merged_values_checked": true,
+  "checked_samples": 12478441,
+  "checked_episodes": 1500,
+  "successful_episodes": 1473,
+  "success_rate": 0.982,
+  "splits": {
+    "0": {
+      "episodes": 1050,
+      "successes": 1028,
+      "samples": 8731691
+    },
+    "1": {
+      "episodes": 225,
+      "successes": 223,
+      "samples": 1877883
+    },
+    "2": {
+      "episodes": 225,
+      "successes": 222,
+      "samples": 1868867
+    }
+  },
+  "failures": [
+    {
+      "episode_id": 8,
+      "final_error": 0.011673792612019267,
+      "reason": "Target not reachable: closest pose reached at t=11.03s (best EE error 0.0110 m, current 0.0117 m)"
+    },
+    {
+      "episode_id": 43,
+      "final_error": 0.011099220844385421,
+      "reason": "Target not reachable: closest pose reached at t=9.63s (best EE error 0.0097 m, current 0.0111 m)"
+    },
+    {
+      "episode_id": 187,
+      "final_error": 0.01168576659492256,
+      "reason": "Target not reachable: closest pose reached at t=11.92s (best EE error 0.0109 m, current 0.0117 m)"
+    },
+    {
+      "episode_id": 225,
+      "final_error": 0.011573690866756164,
+      "reason": "Target not reachable: closest pose reached at t=11.11s (best EE error 0.0102 m, current 0.0116 m)"
+    },
+    {
+      "episode_id": 262,
+      "final_error": 0.01132594668286254,
+      "reason": "Target not reachable: closest pose reached at t=9.50s (best EE error 0.0110 m, current 0.0113 m)"
+    },
+    {
+      "episode_id": 279,
+      "final_error": 0.011620439028295293,
+      "reason": "Target not reachable: closest pose reached at t=11.45s (best EE error 0.0110 m, current 0.0116 m)"
+    },
+    {
+      "episode_id": 280,
+      "final_error": 0.011754514340000716,
+      "reason": "Target not reachable: closest pose reached at t=11.30s (best EE error 0.0110 m, current 0.0118 m)"
+    },
+    {
+      "episode_id": 403,
+      "final_error": 0.011830814905605,
+      "reason": "Target not reachable: closest pose reached at t=11.04s (best EE error 0.0106 m, current 0.0118 m)"
+    },
+    {
+      "episode_id": 413,
+      "final_error": 0.011531498615140502,
+      "reason": "Target not reachable: closest pose reached at t=11.90s (best EE error 0.0110 m, current 0.0115 m)"
+    },
+    {
+      "episode_id": 512,
+      "final_error": 0.011333591033532767,
+      "reason": "Target not reachable: closest pose reached at t=11.29s (best EE error 0.0108 m, current 0.0113 m)"
+    },
+    {
+      "episode_id": 530,
+      "final_error": 0.010341758495250566,
+      "reason": "Target not reachable: closest pose reached at t=9.11s (best EE error 0.0105 m, current 0.0103 m)"
+    },
+    {
+      "episode_id": 627,
+      "final_error": 0.01139360129298993,
+      "reason": "Target not reachable: closest pose reached at t=11.51s (best EE error 0.0112 m, current 0.0114 m)"
+    },
+    {
+      "episode_id": 663,
+      "final_error": 0.0110633601031006,
+      "reason": "Target not reachable: closest pose reached at t=11.74s (best EE error 0.0114 m, current 0.0111 m)"
+    },
+    {
+      "episode_id": 713,
+      "final_error": 0.01177371518843561,
+      "reason": "Target not reachable: closest pose reached at t=11.94s (best EE error 0.0102 m, current 0.0118 m)"
+    },
+    {
+      "episode_id": 727,
+      "final_error": 0.01145440285043785,
+      "reason": "Target not reachable: closest pose reached at t=11.02s (best EE error 0.0110 m, current 0.0115 m)"
+    },
+    {
+      "episode_id": 816,
+      "final_error": 0.011426880328461788,
+      "reason": "Target not reachable: closest pose reached at t=10.92s (best EE error 0.0115 m, current 0.0114 m)"
+    },
+    {
+      "episode_id": 833,
+      "final_error": 0.010831902131458281,
+      "reason": "Target not reachable: closest pose reached at t=9.68s (best EE error 0.0092 m, current 0.0108 m)"
+    },
+    {
+      "episode_id": 853,
+      "final_error": 0.011257967080389491,
+      "reason": "Target not reachable: closest pose reached at t=12.02s (best EE error 0.0110 m, current 0.0113 m)"
+    },
+    {
+      "episode_id": 889,
+      "final_error": 0.011795511260830442,
+      "reason": "Target not reachable: closest pose reached at t=9.48s (best EE error 0.0101 m, current 0.0118 m)"
+    },
+    {
+      "episode_id": 1000,
+      "final_error": 0.011188497299298284,
+      "reason": "Target not reachable: closest pose reached at t=10.84s (best EE error 0.0121 m, current 0.0112 m)"
+    },
+    {
+      "episode_id": 1035,
+      "final_error": 0.011630741421989558,
+      "reason": "Target not reachable: closest pose reached at t=10.14s (best EE error 0.0114 m, current 0.0116 m)"
+    },
+    {
+      "episode_id": 1082,
+      "final_error": 0.011326825397149439,
+      "reason": "Target not reachable: closest pose reached at t=10.86s (best EE error 0.0118 m, current 0.0113 m)"
+    },
+    {
+      "episode_id": 1250,
+      "final_error": 0.011548028462622052,
+      "reason": "Target not reachable: closest pose reached at t=11.14s (best EE error 0.0115 m, current 0.0115 m)"
+    },
+    {
+      "episode_id": 1349,
+      "final_error": 0.01181442410126003,
+      "reason": "Target not reachable: closest pose reached at t=11.53s (best EE error 0.0105 m, current 0.0118 m)"
+    },
+    {
+      "episode_id": 1375,
+      "final_error": 0.01082449532882926,
+      "reason": "Target not reachable: closest pose reached at t=11.39s (best EE error 0.0109 m, current 0.0108 m)"
+    },
+    {
+      "episode_id": 1390,
+      "final_error": 0.011193140078191983,
+      "reason": "Target not reachable: closest pose reached at t=11.20s (best EE error 0.0111 m, current 0.0112 m)"
+    },
+    {
+      "episode_id": 1485,
+      "final_error": 0.01032292058570521,
+      "reason": "Target not reachable: closest pose reached at t=11.49s (best EE error 0.0118 m, current 0.0103 m)"
+    }
+  ],
+  "phase_samples": {
+    "align": 2615049,
+    "drive": 4212682,
+    "orient": 5650710
+  },
+  "final_error_quantiles_m": [
+    7.046978782466193e-05,
+    0.006710440656931078,
+    0.009991847955917317,
+    0.011830814905605
+  ],
+  "duration_range_s": [
+    8.001000000001005,
+    12.017999999998779
+  ],
+  "action_names": [
+    "wheel_FR",
+    "wheel_FL",
+    "wheel_BL",
+    "wheel_BR",
+    "arm_torque_1",
+    "arm_torque_2",
+    "arm_torque_3",
+    "arm_torque_4",
+    "arm_torque_5",
+    "arm_torque_6",
+    "arm_torque_7"
+  ],
+  "action_min": [
+    -3.0,
+    -3.0,
+    -3.0,
+    -3.0,
+    -12.922173763992312,
+    -3.027681064901177,
+    -20.09209152925982,
+    -30.0,
+    -30.0,
+    -30.0,
+    -11.629647755592407
+  ],
+  "action_max": [
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    13.00076135375386,
+    30.0,
+    23.71768276860804,
+    15.750403783601207,
+    26.895498185303776,
+    20.402986523011506,
+    15.106395216056537
+  ],
+  "arm_torque_saturation_fraction": 0.0009885163424776266,
+  "limitations": "Checks stored consistency, not physical correctness, actual state-action timing, full orientation equality, or closed-loop ML performance."
+}
